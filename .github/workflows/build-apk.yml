@@ -47,6 +47,24 @@ jobs:
           gradle-version: "8.7"
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace
+      # Issue #3: the Mini-built APK crashed on launch with
+      # NoClassDefFoundError for androidx.appcompat.R$drawable. The Gradle
+      # APK should include it (AGP packages library R classes), but fail
+      # CI loudly here if it ever goes missing instead of shipping a
+      # broken APK to the tablet.
+      - name: Verify APK dex (issue #3)
+        run: |
+          apk="app/build/outputs/apk/debug/app-debug.apk"
+          # Gradle splits the APK into several dex files (app classes land
+          # in classes3.dex), so check every classes*.dex, not just the first.
+          for cls in 'Landroidx/appcompat/R$drawable;' 'Lnet/npalakurla/jarvis/tablet/MainActivity;'; do
+            found=0
+            for dex in $(unzip -Z1 "$apk" | grep -E '^classes[0-9]*\.dex$'); do
+              if unzip -p "$apk" "$dex" | grep -a -q -F "$cls"; then found=1; break; fi
+            done
+            if [ "$found" = 0 ]; then echo "MISSING in dex: $cls"; exit 1; fi
+          done
+          echo "dex verification: required classes present"
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
