@@ -35,7 +35,13 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
+        with:
+          # v3's default package set included the obsolete `tools` package
+          # (Google removed it; CI failed with "Failed to find package
+          # 'tools'", issue #1). v4 defaults to platform-tools only, so
+          # install the platform + build-tools Gradle needs explicitly.
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
       - uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: "8.7"

@@ -101,26 +101,50 @@ def aar_info(aar_path):
 
 
 def r8_jar():
-    """R8 8.5.35 jar (AGP 8.5.2's dexer). Downloads once if missing."""
+    """R8 8.5.35 jar (AGP 8.5.2's dexer). Downloads once if missing.
+
+    Hardened after the Mini fallback build failed to download it (issue
+    #2): the download directory is created first (on the Mini,
+    ~/workspace/.downloads did not exist, so curl could not write the
+    file), the download is retried, and the jar is validated as a real
+    zip containing the D8 entry point — a truncated download must never
+    be used (a bad R8 jar was the prime suspect for the missing
+    androidx.appcompat.R$drawable crash in issue #3).
+    """
     p = os.environ.get("R8_JAR") or os.path.expanduser(
         "~/workspace/.downloads/r8-8.5.35.jar")
-    if os.path.exists(p) and os.path.getsize(p) > 1_000_000:
+    if _valid_r8_jar(p):
         return p
     url = ("https://dl.google.com/dl/android/maven2/com/android/tools/r8/"
            "8.5.35/r8-8.5.35.jar")
     print(f"downloading R8 8.5.35 from {url} ...")
+    os.makedirs(os.path.dirname(p), exist_ok=True)
     proxy = os.environ.get("HTTPS_PROXY", "")
-    cmd = ["curl", "-sSLf"]
+    cmd = ["curl", "-sSLf", "--retry", "3", "--retry-all-errors",
+           "--retry-delay", "5"]
     if proxy:
         cmd += ["--proxy", proxy]
     cmd += ["-o", p, url]
     r = subprocess.run(cmd)
-    if r.returncode != 0 or not os.path.exists(p) or os.path.getsize(p) < 1_000_000:
+    if r.returncode != 0 or not _valid_r8_jar(p):
+        if os.path.exists(p):
+            os.remove(p)
         raise SystemExit(
-            "could not download R8 8.5.35 jar; set R8_JAR to a local copy "
-            "of https://dl.google.com/dl/android/maven2/com/android/tools/r8/"
-            "8.5.35/r8-8.5.35.jar")
+            "could not download a valid R8 8.5.35 jar; set R8_JAR to a "
+            "local copy of https://dl.google.com/dl/android/maven2/"
+            "com/android/tools/r8/8.5.35/r8-8.5.35.jar")
     return p
+
+
+def _valid_r8_jar(p):
+    """True if p is a real R8 jar (valid zip, contains the D8 entry)."""
+    if not p or not os.path.exists(p) or os.path.getsize(p) < 1_000_000:
+        return False
+    try:
+        with zipfile.ZipFile(p) as z:
+            return "com/android/tools/r8/D8.class" in z.namelist()
+    except zipfile.BadZipFile:
+        return False
 
 
 def main():
@@ -302,6 +326,25 @@ def main():
     print(f"dex files: {[os.path.basename(p) for p in dex_files]}")
     if not dex_files:
         raise SystemExit("d8 produced no dex files")
+
+    # -- 7b. dex verification ---------------------------------------------
+    # Fail loudly if the dex is missing a class the app needs at launch.
+    # The Mini-built APK crashed on launch with NoClassDefFoundError for
+    # androidx.appcompat.R$drawable (issue #3) — a bad R8 jar or a bad
+    # dex step must never again ship as a silent broken APK.
+    required_dex_classes = [
+        "Landroidx/appcompat/R$drawable;",
+        "Lnet/npalakurla/jarvis/tablet/MainActivity;",
+        "Landroidx/appcompat/app/AppCompatActivity;",
+        "Landroidx/webkit/WebViewCompat;",
+        "Lai/onnxruntime/OrtEnvironment;",
+    ]
+    dex_bytes = b"".join(open(f, "rb").read() for f in dex_files)
+    missing = [c for c in required_dex_classes if c.encode() not in dex_bytes]
+    if missing:
+        raise SystemExit("dex verification failed — missing classes: "
+                         + ", ".join(missing))
+    print("dex verification: all required classes present")
 
     # -- 8. assemble the APK -------------------------------------------------
     apk = os.path.join(BUILD, "jarvis-tablet-debug.apk")
