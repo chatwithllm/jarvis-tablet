@@ -1,0 +1,26 @@
+# Android / Gradle
+*.iml
+.gradle/
+local.properties
+.idea/
+build/
+*.apk
+*.aab
+
+# Signing — never commit
+*.keystore
+*.jks
+keystore.properties
+
+# Secrets — never commit
+secrets.yaml
+*.token
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (if the web HUD is built with tooling)
+node_modules/
+dist/
