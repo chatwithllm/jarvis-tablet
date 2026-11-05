@@ -147,10 +147,42 @@ def _valid_r8_jar(p):
         return False
 
 
+def dex_defined_classes(dex_path):
+    """Return the set of class descriptors DEFINED in a .dex file.
+
+    Reads the class_defs section (not the string table): a mere
+    reference to a class puts its descriptor in the string table
+    without defining it, so a substring search false-passes (issue
+    #5 — the dex had the R$drawable descriptor string but zero R
+    class definitions, and the app crashed on launch).
+    """
+    import struct
+    data = open(dex_path, "rb").read()
+    string_ids_size, string_ids_off = struct.unpack_from("<2I", data, 0x38)
+    type_ids_size, type_ids_off = struct.unpack_from("<2I", data, 0x40)
+    class_defs_size, class_defs_off = struct.unpack_from("<2I", data, 0x60)
+    string_offs = struct.unpack_from(f"<{string_ids_size}I", data, string_ids_off)
+    type_idxs = struct.unpack_from(f"<{type_ids_size}I", data, type_ids_off)
+    defined = set()
+    for i in range(class_defs_size):
+        class_idx = struct.unpack_from("<I", data, class_defs_off + i * 32)[0]
+        off = string_offs[type_idxs[class_idx]]
+        # MUTF-8 string: uleb128 length, bytes, NUL. Read to the NUL
+        # (class descriptors are ASCII, so this is exact).
+        pos = off
+        while data[pos] & 0x80:
+            pos += 1
+        pos += 1
+        end = data.index(b"\x00", pos)
+        defined.add(data[pos:end].decode("utf-8", errors="replace"))
+    return defined
+
+
 def main():
     java_bin = os.path.join(JAVA_HOME, "bin", "java")
+    javac = os.path.join(JAVA_HOME, "bin", "javac")
     kotlinc = os.path.join(KOTLINC_HOME, "bin", "kotlinc")
-    for p, what in [(java_bin, "java"), (kotlinc, "kotlinc"),
+    for p, what in [(java_bin, "java"), (javac, "javac"), (kotlinc, "kotlinc"),
                     (os.path.join(SDK, "platforms", "android-34", "android.jar"), "android.jar")]:
         if not os.path.exists(p):
             raise SystemExit(f"missing {what}: {p}")
@@ -292,6 +324,21 @@ def main():
         *kt_sources, *gen_java,
     ], env=env)
 
+    # -- 6b. javac -------------------------------------------------------
+    # kotlinc accepts the generated R.java files (it needs them to
+    # resolve R.* references in the Kotlin code) but emits NO .class
+    # files for them — the dex ended up with zero R classes and the app
+    # crashed on launch with NoClassDefFoundError for
+    # androidx.appcompat.R$drawable (issues #3, #5). Compile them
+    # explicitly with javac into the same classes dir.
+    if gen_java:
+        run([
+            javac, "-source", "17", "-target", "17",
+            "-cp", ":".join(compile_cp),
+            "-d", os.path.join(MANUAL, "classes"),
+            *gen_java,
+        ], env=env)
+
     # -- 7. d8 --------------------------------------------------------------
     # d8 rejects a raw classes directory (it chokes on kotlinc's
     # META-INF/*.kotlin_module files), so jar the compiled classes first —
@@ -332,6 +379,10 @@ def main():
     # The Mini-built APK crashed on launch with NoClassDefFoundError for
     # androidx.appcompat.R$drawable (issue #3) — a bad R8 jar or a bad
     # dex step must never again ship as a silent broken APK.
+    # NOTE: check the class_defs section, NOT a byte-substring search:
+    # a mere reference to R$drawable puts its descriptor in the dex
+    # string table without defining the class, so substring matching
+    # false-passed while the dex had zero R classes (issue #5).
     required_dex_classes = [
         "Landroidx/appcompat/R$drawable;",
         "Lnet/npalakurla/jarvis/tablet/MainActivity;",
@@ -339,12 +390,14 @@ def main():
         "Landroidx/webkit/WebViewCompat;",
         "Lai/onnxruntime/OrtEnvironment;",
     ]
-    dex_bytes = b"".join(open(f, "rb").read() for f in dex_files)
-    missing = [c for c in required_dex_classes if c.encode() not in dex_bytes]
+    defined = set()
+    for f in dex_files:
+        defined |= dex_defined_classes(f)
+    missing = [c for c in required_dex_classes if c not in defined]
     if missing:
         raise SystemExit("dex verification failed — missing classes: "
                          + ", ".join(missing))
-    print("dex verification: all required classes present")
+    print("dex verification: all required classes defined")
 
     # -- 8. assemble the APK -------------------------------------------------
     apk = os.path.join(BUILD, "jarvis-tablet-debug.apk")

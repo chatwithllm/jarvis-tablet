@@ -55,16 +55,22 @@ jobs:
       - name: Verify APK dex (issue #3)
         run: |
           apk="app/build/outputs/apk/debug/app-debug.apk"
-          # Gradle splits the APK into several dex files (app classes land
-          # in classes3.dex), so check every classes*.dex, not just the first.
+          # A byte-substring grep FALSE-PASSES (issue #5): any class
+          # referencing R$drawable puts its descriptor in the dex string
+          # table without the class being defined. Check the real class
+          # definitions with dexdump instead. Gradle splits the APK into
+          # several dex files (app classes land in classes3.dex), so check
+          # every classes*.dex, not just the first.
+          dexdump="$ANDROID_HOME/build-tools/34.0.0/dexdump"
+          mkdir -p /tmp/dexcheck && cd /tmp/dexcheck && unzip -o -q "$GITHUB_WORKSPACE/android/$apk" 'classes*.dex'
           for cls in 'Landroidx/appcompat/R$drawable;' 'Lnet/npalakurla/jarvis/tablet/MainActivity;'; do
             found=0
-            for dex in $(unzip -Z1 "$apk" | grep -E '^classes[0-9]*\.dex$'); do
-              if unzip -p "$apk" "$dex" | grep -a -q -F "$cls"; then found=1; break; fi
+            for dex in classes*.dex; do
+              if "$dexdump" -f "$dex" 2>/dev/null | grep "Class descriptor" | grep -q -F "$cls"; then found=1; break; fi
             done
-            if [ "$found" = 0 ]; then echo "MISSING in dex: $cls"; exit 1; fi
+            if [ "$found" = 0 ]; then echo "MISSING class_def: $cls"; exit 1; fi
           done
-          echo "dex verification: required classes present"
+          echo "dex verification: required classes defined"
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
