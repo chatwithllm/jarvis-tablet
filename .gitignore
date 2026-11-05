@@ -1,11 +1,27 @@
-# Android / Gradle
+# HUD fonts are binary TTFs — not committed; CI fetches them from Google
+# Fonts (OFL) at build time (see .github/workflows/build-apk.yml).
+# The manual pipeline (scripts/build-apk.sh) uses the local copies.
+android/app/src/main/assets/web/fonts/*.ttf
+web/fonts/*.ttf
+
+# Android build outputs
+android/app/build/
+android/build/
+android/.gradle/
+android/local.properties
 *.iml
-.gradle/
-local.properties
 .idea/
-build/
 *.apk
 *.aab
+# Generated HUD assets (rebuilt by the copyHud Gradle task from web/
+# into assets/hud/). The HUD source itself lives in
+# android/app/src/main/assets/web/ and IS tracked.
+android/app/src/main/assets/hud/
+
+# Downloaded Android dependencies (reproducible: android/libs/resolve.py
+# + resolved.txt re-download them). Keep resolve.py + resolved.txt.
+android/libs/*.aar
+android/libs/*.jar
 
 # Signing — never commit
 *.keystore

@@ -6,7 +6,34 @@ P11 (TB-J606F, Android 11, 2000x1200), shipped as a sideloadable APK.
 - Package: `net.npalakurla.jarvis.tablet`
 - PRD: `projects/jarvis-lenovo-apk-prd.md` (v2.2, 5 Nov 2026) — also at
   https://jarvis-lenovo-apk-prd-v4lk.pages.grok.bot/
-- Status: **Phase 0 — preconditions.** No APK built yet.
+- Status: **Phase 1 — HUD APK code written 2026-11-05** (Kotlin WebView
+  shell + bundled HUD + wake-service shell + CI debug build). No APK
+  built yet — the first CI run happens on the next push to `main`.
+  **Phase 0 evidence is still open** (HA version, expose audit, Whisper
+  + Piper, Grok trial, HA user + token, keystore, wireless ADB) — those
+  checks touch HA / the Mini / the tablet, so they need LAN access (see
+  below). Phase 1 code was written on Simba's "i want you to build it"
+  (2026-11-05); each phase still needs his explicit go-ahead before
+  merge or sideload.
+
+## What needs Tailscale, and what doesn't
+
+- **Building the app: no Tailscale needed.** The code lives in this
+  repo, GitHub Actions compiles the debug APK on every push, and the
+  APK comes back as a downloadable artifact. That is how Phase 1 was
+  built — entirely in the cloud.
+- **Phase 0 checks: need LAN.** HA version, the expose audit, Whisper
+  + Piper install, the Grok trial, the HA user + token, the keystore
+  check, and the wireless-ADB reboot test all run on HA (192.168.20.11),
+  the Mac Mini, or the tablet (192.168.20.109:5555). The cloud cannot
+  reach those addresses. The path is the `muse-mgmt` VM's Tailscale
+  approval (pending since 2026-10-27): once approved, the cloud SSHes
+  in and runs those steps itself.
+- **Sideload + on-device testing: need LAN.** `adb install -r` talks
+  to the tablet over Wi-Fi adb. Alternatives without Tailscale: Hermes
+  / Grok Bot runs the LAN steps from the Mini, or Simba runs
+  `scripts/adb-install.sh` from the Mini himself after downloading the
+  CI-built APK.
 
 ## Locked decisions (do not re-ask)
 
@@ -50,10 +77,16 @@ P11 (TB-J606F, Android 11, 2000x1200), shipped as a sideloadable APK.
 
 ## Layout
 
-- `android/` — Kotlin WebView shell APK + native wake-word foreground
-  service + native HA client (token in Keystore).
+- `android/` — Gradle project (`settings.gradle.kts`, `app/` module):
+  Kotlin WebView shell APK + native wake-word foreground service +
+  native HA client (token in Keystore). Sources under
+  `app/src/main/java/net/npalakurla/jarvis/tablet/`; HUD assets under
+  `app/src/main/assets/web/`. CI builds it (`.github/workflows/`).
 - `web/` — bundled Jarvis HUD (HTML/CSS/JS, Magic Mirror tokens).
+  The source of truth is `android/app/src/main/assets/web/`; this
+  folder holds the design notes.
 - `wake/` — openWakeWord model + training/tuning notes (`hey_jack.onnx`).
+  Model not trained yet — see `docs/wake-tuning.md`.
 - `ha/` — Assist pipeline, policy controller, expose audit, YAML tools.
 - `mini/` — Mini grocery proxy (LAN only, holds the token + dedupe logic).
 - `docs/` — phase checklists, grocery contract, bridge contract.

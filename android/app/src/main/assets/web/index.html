@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<!-- Jarvis tablet HUD — Phase 1 (PRD v2.2). Plain HTML/CSS/JS, one page.
+     Magic Mirror tokens: black, cyan #00E5FF, chamfered cards, thin
+     hairlines, transform/opacity motion only. Landscape 2000x1200.
+     The WebView never holds a token or a key: it talks to native only
+     through the bridge (docs/bridge-contract.md). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app">
+  <!-- FR-11 pickup banner: cyan -30..-10, amber -10..0, red 0..+15, hidden after +15 -->
+  <header id="banner" class="hidden"><span id="banner-text"></span><span id="banner-clock"></span></header>
+
+  <div id="middle">
+    <nav id="rail" aria-label="Views">
+      <button data-view="overview" class="active">Home</button>
+      <button data-view="ha">HA</button>
+      <button data-view="pve">PVE</button>
+      <button data-view="updates">Updates</button>
+      <button data-view="cams">Cams</button>
+      <button data-view="bots">Bots</button>
+    </nav>
+
+    <main id="content">
+      <section id="view-overview" class="view active">
+        <div class="hud-clock"><span id="clock">--:--</span><span id="date"></span></div>
+        <div id="overview-cards" class="cards"></div>
+      </section>
+      <section id="view-ha" class="view"><h2>Home Assistant</h2><div id="ha-cards" class="cards"></div></section>
+      <section id="view-pve" class="view"><h2>Proxmox</h2><div id="pve-cards" class="cards"></div></section>
+      <section id="view-updates" class="view"><h2>Updates</h2><div id="updates-cards" class="cards"></div></section>
+      <section id="view-cams" class="view"><h2>Cameras</h2><div id="cams-cards" class="cards"></div></section>
+      <section id="view-bots" class="view"><h2>Bots</h2><div id="bots-cards" class="cards"></div></section>
+    </main>
+
+    <!-- Right column: transcript + confirm + result cards (max 2, FR-15/FR-24) -->
+    <aside id="cards">
+      <div id="transcript" class="card">
+        <div class="card-title">Jarvis <span id="updated-stamp" class="stamp"></span></div>
+        <div id="transcript-text" class="muted">Say “Hey Jack” or tap Talk.</div>
+      </div>
+      <div id="confirm-card" class="card hidden">
+        <div class="card-title">Confirm <span id="confirm-timer" class="stamp"></span></div>
+        <div id="confirm-summary"></div>
+        <div class="confirm-row">
+          <button id="confirm-yes">Yes</button>
+          <button id="confirm-no">No</button>
+        </div>
+      </div>
+      <div id="result-cards"></div>
+    </aside>
+  </div>
+
+  <!-- FR-13 dock: Home, Cams, Bots, Updates + Talk (FR-14) -->
+  <footer id="dock">
+    <button data-dock="overview">Home</button>
+    <button data-dock="cams">Cams</button>
+    <button data-dock="bots">Bots</button>
+    <button data-dock="updates">Updates</button>
+    <div id="orb-wrap">
+      <button id="orb" aria-label="Talk">●</button>
+      <div id="orb-ring"></div>
+    </div>
+    <span id="status-line"><span id="ha-dot" class="dot off"></span><span id="status-text">Connecting…</span></span>
+    <span id="quiet-badge" class="hidden">Quiet hours</span>
+    <span id="offline-badge" class="hidden">Offline</span>
+  </footer>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

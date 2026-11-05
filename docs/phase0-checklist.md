@@ -1,5 +1,12 @@
 # Phase 0 checklist (PRD v2.2)
 
+> Status note 2026-11-05: Phase 1 code (HUD APK + wake-service shell +
+> CI build) was written on Simba's "i want you to build it" — the build
+> itself needed no LAN. The evidence items below are still open: every
+> one of them touches HA / the Mini / the tablet, so they need LAN
+> access (muse-mgmt Tailscale approval, pending since 2026-10-27) or a
+> Mini-side run. Nothing below is verified yet.
+
 Status first, then complete what's missing. For each item record FOUND /
 MISSING with exact evidence. Phase 1 needs Simba's go-ahead after this
 report.

@@ -1,0 +1,49 @@
+# Build the Jarvis tablet debug APK on every push to main (and on PRs).
+# This is how the app gets built without Tailscale and without the Mac
+# Mini: code is written in the cloud, CI compiles it, and the APK comes
+# back as a downloadable artifact. Sideloading it onto the tablet still
+# needs LAN adb (scripts/adb-install.sh) — that part is not CI's job.
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+      # HUD fonts are binary TTFs and are not committed to the repo;
+      # fetch them from Google Fonts (OFL) so the CI APK has the real
+      # Rajdhani / Share Tech Mono faces instead of fallback fonts.
+      - name: Fetch HUD fonts (OFL, Google Fonts)
+        run: |
+          mkdir -p app/src/main/assets/web/fonts
+          base="https://github.com/google/fonts/raw/main"
+          curl -sL "$base/ofl/rajdhani/Rajdhani-Regular.ttf" -o app/src/main/assets/web/fonts/Rajdhani-Regular.ttf
+          curl -sL "$base/ofl/rajdhani/Rajdhani-Medium.ttf" -o app/src/main/assets/web/fonts/Rajdhani-Medium.ttf
+          curl -sL "$base/ofl/rajdhani/Rajdhani-SemiBold.ttf" -o app/src/main/assets/web/fonts/Rajdhani-SemiBold.ttf
+          curl -sL "$base/ofl/rajdhani/Rajdhani-Bold.ttf" -o app/src/main/assets/web/fonts/Rajdhani-Bold.ttf
+          curl -sL "$base/ofl/sharetechmono/ShareTechMono-Regular.ttf" -o app/src/main/assets/web/fonts/ShareTechMono.ttf
+          ls -l app/src/main/assets/web/fonts
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.7"
+      - name: Build debug APK
+        run: gradle :app:assembleDebug --stacktrace
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-tablet-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
