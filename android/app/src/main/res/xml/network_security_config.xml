@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Network security config — issue #15.
+     Android blocks cleartext HTTP by default (targetSdk 34). The
+     ContextForge MCP gateway is plain HTTP on the LAN, so HaClient's
+     calls to it were refused before leaving the tablet
+     ("Cleartext HTTP traffic to 192.168.20.217 not permitted") and
+     FR-13 / FR-11 failed. Permit cleartext ONLY for the two LAN
+     gateway addresses (Wi-Fi 192.168.20.217, Ethernet 192.168.60.189).
+     Everything else keeps the platform default (cleartext denied). -->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">192.168.20.217</domain>
+        <domain includeSubdomains="false">192.168.60.189</domain>
+    </domain-config>
+</network-security-config>
