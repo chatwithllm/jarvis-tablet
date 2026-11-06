@@ -21,9 +21,11 @@ APK lands at `android/build/jarvis-tablet-debug.apk`.
   exemption (FR-06), 60 s HA heartbeat (FR-07), bridge host.
 - `JarvisBridge.kt` — bridge contract (PRD v2.2 event names; see
   `docs/bridge-contract.md`). No credential crosses the bridge.
-- `HaClient.kt` + `TokenStore` — HA REST client; token in
-  Keystore-backed EncryptedSharedPreferences, never in the WebView.
-  401 surfaces as `auth_required` (FR-54 re-auth prompt).
+- `HaClient.kt` + `TokenStore` — ContextForge MCP client (issue #10);
+  gateway URL + scoped `jarvis-ha` bearer in Keystore-backed
+  EncryptedSharedPreferences, never in the WebView. The gateway is
+  read-only, so the FR-07 heartbeat is a liveness probe, not an HA
+  sensor write. 401 surfaces as `auth_required` (FR-54 re-auth prompt).
 - `PolicyController.kt` — Phase 2 policy rules as pure logic: hard
   denylist (lock / alarm / garage, FR-25), 10 s confirm expiry
   (FR-24), source-device binding (FR-55), audit log (FR-51).

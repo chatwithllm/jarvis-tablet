@@ -12,13 +12,15 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 
 /**
- * First-run HA setup + FR-54 re-auth prompt.
+ * First-run ContextForge setup + FR-54 re-auth prompt.
  *
- * Collects the Home Assistant URL and the long-lived token for the
- * dedicated non-admin user `jarvis-tablet` (Phase 0 item 5) and stores
- * them in Keystore-backed EncryptedSharedPreferences via [TokenStore].
- * The token is never shown in the HUD, never logged, and never leaves
- * the device. Voice stays disabled until valid credentials are saved.
+ * Collects the ContextForge MCP gateway URL and the scoped `jarvis-ha`
+ * bearer (issue #10, owner direction 2026-11-05) and stores them in
+ * Keystore-backed EncryptedSharedPreferences via [TokenStore]. The
+ * tablet never holds a raw Home Assistant long-lived token — the
+ * upstream HA credential lives in the gateway DB. The bearer is never
+ * shown in the HUD, never logged, and never leaves the device. Voice
+ * stays disabled until valid credentials are saved.
  */
 class SettingsActivity : AppCompatActivity() {
 
@@ -26,12 +28,12 @@ class SettingsActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         val urlInput = EditText(this).apply {
-            hint = "Home Assistant URL (e.g. http://192.168.20.11:8123)"
+            hint = "ContextForge URL (MCP endpoint)"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            setText(TokenStore.getHaUrl(this@SettingsActivity) ?: "http://192.168.20.11:8123")
+            setText(TokenStore.getCfUrl(this@SettingsActivity) ?: TokenStore.DEFAULT_CF_URL)
         }
         val tokenInput = EditText(this).apply {
-            hint = "Long-lived access token (jarvis-tablet user)"
+            hint = "ContextForge bearer token (jarvis-ha)"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
         val save = Button(this).apply {
@@ -44,7 +46,7 @@ class SettingsActivity : AppCompatActivity() {
                     return@setOnClickListener
                 }
                 if (token.isEmpty()) {
-                    Toast.makeText(this@SettingsActivity, "Paste the jarvis-tablet token from Home Assistant", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this@SettingsActivity, "Paste the jarvis-ha bearer token issued by IT Admin", Toast.LENGTH_LONG).show()
                     return@setOnClickListener
                 }
                 TokenStore.save(this@SettingsActivity, url, token)
@@ -56,16 +58,18 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
         val note = TextView(this).apply {
-            text = "The token is stored encrypted on this tablet only. " +
-                "Create it in Home Assistant under the jarvis-tablet user " +
-                "(non-admin, revocable). It never goes in the WebView or the repo."
+            text = "The bearer is stored encrypted on this tablet only. " +
+                "It is issued by IT Admin for this tablet (jarvis-ha scope). " +
+                "The Home Assistant credential stays in the gateway — " +
+                "no raw HA token is ever typed here or stored on the tablet. " +
+                "It never goes in the WebView or the repo."
             gravity = Gravity.CENTER
         }
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             setPadding(96, 96, 96, 96)
-            addView(TextView(context).apply { text = "Jarvis — connect Home Assistant"; textSize = 24f; gravity = Gravity.CENTER })
+            addView(TextView(context).apply { text = "Jarvis — connect ContextForge"; textSize = 24f; gravity = Gravity.CENTER })
             addView(urlInput)
             addView(tokenInput)
             addView(save)

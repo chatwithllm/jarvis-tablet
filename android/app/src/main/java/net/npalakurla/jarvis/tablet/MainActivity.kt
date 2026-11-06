@@ -119,7 +119,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
 
     private fun startWakeServiceIfConfigured() {
         if (!TokenStore.hasCredentials(this)) {
-            // No HA URL/token yet: collect them natively first. The HUD
+            // No ContextForge URL/bearer yet: collect them natively first. The HUD
             // cannot do anything useful without a hub to talk to.
             startActivity(Intent(this, SettingsActivity::class.java))
             return
@@ -127,13 +127,13 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
         WakeService.start(this)
     }
 
-    /** FR-54: revoked token -> re-auth prompt, voice disabled, no loop. */
+    /** FR-54: rejected bearer -> re-auth prompt, voice disabled, no loop. */
     fun promptReauth() {
         bridge.sendEvent(
             "error",
             JSONObject()
                 .put("code", "auth_required")
-                .put("message", "Home Assistant sign-in expired. Voice is off until you re-enter the token."),
+                .put("message", "ContextForge sign-in expired. Voice is off until you re-enter the bearer token."),
         )
         startActivity(Intent(this, SettingsActivity::class.java))
     }
