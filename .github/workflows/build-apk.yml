@@ -53,7 +53,13 @@ jobs:
       # docs/signing.md for the one-time setup). This step FAILS HARD when
       # the secret is missing, so a missing secret can never silently
       # ship another mismatched APK.
-      - name: Restore stable debug keystore (issues #8/#14)
+      # Issue #18: the restore to ~/.android/debug.keystore was evidently
+      # NOT picked up by the build (run #9 signed a2b10c0f, run #10 signed
+      # f8fa22da, secret is e71000e0 — three different keys). The
+      # build.gradle.kts debug signingConfig now points explicitly at
+      # android/debug.keystore in the project dir, so restore the keystore
+      # THERE (no HOME ambiguity) and print its fingerprint from that file.
+      - name: Restore stable debug keystore (issues #8/#14/#18)
         env:
           DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
         run: |
@@ -63,17 +69,13 @@ jobs:
             echo "add it as a repo secret, then re-run this workflow."
             exit 1
           fi
-          mkdir -p ~/.android
-          echo "$DEBUG_KEYSTORE_BASE64" | base64 -d > ~/.android/debug.keystore
-          keytool -list -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey >/dev/null \
+          echo "$DEBUG_KEYSTORE_BASE64" | base64 -d > debug.keystore
+          keytool -list -keystore debug.keystore -storepass android -alias androiddebugkey >/dev/null \
             || { echo "ERROR: decoded keystore is invalid (expected alias androiddebugkey, storepass android)"; exit 1; }
           echo "stable debug keystore restored"
-          # Issue #18: the signer drifted between 581e980 and 21fc9c9
-          # even though both runs logged the restore. Print the
-          # keystore's SHA-256 fingerprint so every run logs exactly
-          # which key signed the APK — a drift is then visible in the
-          # log instead of only on the tablet at install time.
-          keytool -list -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey \
+          # Issue #18: print the keystore's SHA-256 fingerprint so every
+          # run logs exactly which key signed the APK.
+          keytool -list -v -keystore debug.keystore -storepass android -alias androiddebugkey \
             | grep -E "SHA256:|Alias name:"
       - uses: gradle/actions/setup-gradle@v3
         with:

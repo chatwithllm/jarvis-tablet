@@ -15,7 +15,32 @@ android {
         versionName = "0.1.0-phase1"
     }
 
+    // Issue #18: the debug build type had NO explicit signingConfig,
+    // so AGP fell back to its default debug-keystore lookup — and the
+    // CI restore step's keystore was evidently not picked up (run #9
+    // signed a2b10c0f, run #10 signed f8fa22da, while the secret is
+    // e71000e0). Pin the debug signing config explicitly to the
+    // keystore file the CI workflow restores into the project dir
+    // (android/debug.keystore, gitignored) when it exists. Every CI
+    // debug APK is then signed with the one canonical secret key, no
+    // HOME ambiguity. Local/VM builds without that file fall back to
+    // AGP's default debug keystore (~/.android/debug.keystore).
+    signingConfigs {
+        getByName("debug") {
+            val keystoreFile = rootProject.file("debug.keystore")
+            if (keystoreFile.exists()) {
+                storeFile = keystoreFile
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("debug")
+        }
         release {
             isMinifyEnabled = false
             // Release signing uses the Mini keystore (see README).

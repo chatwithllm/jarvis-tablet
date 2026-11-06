@@ -26,6 +26,8 @@ wake/data/
 wake/__pycache__/
 wake/*.npy
 wake/val_stream.wav
+# CI-restored debug keystore (issue #18) — the secret key, never committed.
+android/debug.keystore
 mini/__pycache__/
 
 # Downloaded Android dependencies (reproducible: android/libs/resolve.py
