@@ -68,6 +68,13 @@ jobs:
           keytool -list -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey >/dev/null \
             || { echo "ERROR: decoded keystore is invalid (expected alias androiddebugkey, storepass android)"; exit 1; }
           echo "stable debug keystore restored"
+          # Issue #18: the signer drifted between 581e980 and 21fc9c9
+          # even though both runs logged the restore. Print the
+          # keystore's SHA-256 fingerprint so every run logs exactly
+          # which key signed the APK — a drift is then visible in the
+          # log instead of only on the tablet at install time.
+          keytool -list -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey \
+            | grep -E "SHA256:|Alias name:"
       - uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: "8.7"
