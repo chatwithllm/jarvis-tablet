@@ -1,12 +1,14 @@
 package net.npalakurla.jarvis.tablet
 
 import android.content.Context
+import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
@@ -86,22 +88,26 @@ class HaClient(private val context: Context) {
 
     /**
      * Extract the `result` object from an MCP response body, which may
-     * be a single JSON object or an SSE stream (`event:` / `data:` lines
-     * — take the last `data:` payload, which carries the final result).
+     * be a single JSON object or an SSE stream (`event:` / `data:` lines).
+     * An SSE stream can carry several messages (result, notifications);
+     * prefer the one carrying a `result` field, and fall back to the
+     * last JSON data line. A JSON-RPC `error` is a failure.
      */
     private fun parseRpcResult(text: String): JSONObject? {
-        val jsonText = if (text.contains("data:")) {
+        val candidates: List<String> = if (text.contains("data:")) {
             text.lineSequence()
                 .filter { it.trimStart().startsWith("data:") }
                 .map { it.substringAfter("data:").trim() }
                 .filter { it.startsWith("{") }
-                .lastOrNull() ?: return null
+                .toList()
         } else {
-            text.trim()
+            listOf(text.trim())
         }
-        val obj = runCatching { JSONObject(jsonText) }.getOrNull() ?: return null
-        if (obj.has("error")) return null
-        return obj.optJSONObject("result")
+        val parsed = candidates.mapNotNull { runCatching { JSONObject(it) }.getOrNull() }
+        val chosen = parsed.lastOrNull { it.has("result") } ?: parsed.lastOrNull()
+            ?: return null
+        if (chosen.has("error")) return null
+        return chosen.optJSONObject("result")
     }
 
     /** MCP initialize handshake (once per client instance). */
@@ -154,7 +160,14 @@ class HaClient(private val context: Context) {
             put("name", name)
             put("arguments", arguments)
         }
-        return mcpCall("tools/call", params)
+        val result = mcpCall("tools/call", params) ?: return null
+        if (result.optBoolean("isError", false)) {
+            // The tool itself failed (gateway-side). Surface the tool's
+            // error text (capped) instead of feeding it to the parser.
+            val err = toolText(result)?.take(200) ?: "unknown tool error"
+            throw IllegalStateException("$name tool error: $err")
+        }
+        return result
     }
 
     /** First text item of a tools/call result, or null. */
@@ -181,25 +194,68 @@ class HaClient(private val context: Context) {
             val text = toolText(callTool("ha-get-states"))
                 ?: throw IllegalStateException("ha-get-states returned no content")
             normalizeStates(text)
+        }.onFailure { e ->
+            // Log the reason (never the bearer) so a device test can
+            // tell a transport failure from a payload-shape failure.
+            Log.w("HaClient", "getStates failed: ${e.message}")
         }
     }
 
     /**
-     * Normalize an ha-get-states text payload to a JSON-array string:
-     * a bare array passes through; an object is searched for an array
-     * under `states`, `result`, or `data`; anything else fails loudly
-     * instead of handing the HUD an unparseable payload.
+     * Normalize an ha-get-states text payload to a JSON-array string.
+     * The real gateway's shape is not fixed: the text may be a bare
+     * array, a JSON string holding JSON (double-encoded), or an object
+     * with the array nested at any depth. Parse with JSONTokener, unwrap
+     * one level of string encoding, then search recursively for the
+     * states array. Anything else fails loudly instead of handing the
+     * HUD an unparseable payload.
      */
     private fun normalizeStates(text: String): String {
         val trimmed = text.trim()
-        runCatching { JSONArray(trimmed) }.onSuccess { return trimmed }
-        runCatching {
-            val obj = JSONObject(trimmed)
-            for (key in listOf("states", "result", "data")) {
-                obj.optJSONArray(key)?.let { return it.toString() }
-            }
+        var value: Any? = runCatching { JSONTokener(trimmed).nextValue() }.getOrNull()
+        // Double-encoded: the tool text is itself a JSON string holding JSON.
+        if (value is String) {
+            value = runCatching { JSONTokener(value.trim()).nextValue() }.getOrNull()
         }
-        throw IllegalStateException("ha-get-states returned a non-array payload")
+        val arr = findStatesArray(value)
+            ?: throw IllegalStateException("ha-get-states returned a non-array payload")
+        return arr.toString()
+    }
+
+    /**
+     * Find the HA states array inside a parsed value, at any depth. A
+     * states array is an array whose first element is an object with an
+     * `entity_id` (an empty array counts — zero entities is valid). The
+     * obvious keys are tried first, then every other key, then array
+     * elements, so nesting and wrapper objects both work.
+     */
+    private fun findStatesArray(value: Any?): JSONArray? {
+        when (value) {
+            is JSONArray -> {
+                if (value.length() == 0) return value
+                val first = value.opt(0)
+                if (first is JSONObject && first.has("entity_id")) return value
+                for (i in 0 until value.length()) {
+                    findStatesArray(value.opt(i))?.let { return it }
+                }
+                return null
+            }
+            is JSONObject -> {
+                for (key in listOf("states", "result", "data")) {
+                    if (value.has(key)) {
+                        findStatesArray(value.opt(key))?.let { return it }
+                    }
+                }
+                val keys = value.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    if (k in listOf("states", "result", "data")) continue
+                    findStatesArray(value.opt(k))?.let { return it }
+                }
+                return null
+            }
+            else -> return null
+        }
     }
 
     /**

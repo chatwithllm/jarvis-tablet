@@ -70,7 +70,7 @@
     setTranscript(p.message || "Something went wrong.");
     if (p.code === "ha_unreachable") markOffline(true);
     if (p.code === "auth_required") {
-      setTranscript("Home Assistant sign-in expired. Voice is off until you re-enter the token.");
+      setTranscript("ContextForge sign-in expired. Voice is off until you re-enter the bearer token.");
     }
   }
 
@@ -80,7 +80,7 @@
     $("ha-dot").className = "dot" + (state.haOk ? "" : " off");
     $("status-text").textContent = state.haOk
       ? (state.quiet ? "Connected · quiet hours" : "Connected")
-      : "Home Assistant unreachable";
+      : "ContextForge unreachable";
     $("quiet-badge").classList.toggle("hidden", !state.quiet);
     $("orb").classList.toggle("offline", !state.haOk);
     markOffline(!state.haOk);
