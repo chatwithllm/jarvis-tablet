@@ -22,6 +22,10 @@ android/app/src/main/assets/hud/
 # tracked; the venv used to train them is not.
 android/app/src/main/assets/wake/
 wake/venv/
+wake/data/
+wake/__pycache__/
+wake/*.npy
+wake/val_stream.wav
 mini/__pycache__/
 
 # Downloaded Android dependencies (reproducible: android/libs/resolve.py
