@@ -36,6 +36,16 @@
             </intent-filter>
         </activity>
 
+        <!-- FR-54: first-run HA setup / re-auth. Was missing from the
+             manifest (issue #7): MainActivity launches it on first run,
+             but an undeclared activity throws ActivityNotFoundException
+             and the fresh install can never reach Settings or the HUD. -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
         <!-- Phase 1: foreground service for the pinned notification,
              HA heartbeat (FR-07) and reachability probe. The openWakeWord
              listener is Phase 2; it is NOT wired here yet. -->
