@@ -36,11 +36,17 @@ class SettingsActivity : AppCompatActivity() {
             hint = "ContextForge bearer token (jarvis-ha)"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
+        val relayInput = EditText(this).apply {
+            hint = "Voice relay URL (Mini, e.g. http://192.168.20.x:8792) — optional"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setText(TokenStore.getVoiceRelayUrl(this@SettingsActivity) ?: "")
+        }
         val save = Button(this).apply {
             text = "Save and start Jarvis"
             setOnClickListener {
                 val url = urlInput.text.toString().trim()
                 val token = tokenInput.text.toString().trim()
+                val relay = relayInput.text.toString().trim()
                 if (!url.startsWith("http://") && !url.startsWith("https://")) {
                     Toast.makeText(this@SettingsActivity, "URL must start with http:// or https://", Toast.LENGTH_LONG).show()
                     return@setOnClickListener
@@ -49,7 +55,12 @@ class SettingsActivity : AppCompatActivity() {
                     Toast.makeText(this@SettingsActivity, "Paste the jarvis-ha bearer token issued by IT Admin", Toast.LENGTH_LONG).show()
                     return@setOnClickListener
                 }
+                if (relay.isNotEmpty() && !relay.startsWith("http://") && !relay.startsWith("https://")) {
+                    Toast.makeText(this@SettingsActivity, "Voice relay URL must start with http:// or https://", Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
                 TokenStore.save(this@SettingsActivity, url, token)
+                if (relay.isNotEmpty()) TokenStore.saveVoiceRelayUrl(this@SettingsActivity, relay)
                 startActivity(
                     Intent(this@SettingsActivity, MainActivity::class.java)
                         .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK),
@@ -72,6 +83,7 @@ class SettingsActivity : AppCompatActivity() {
             addView(TextView(context).apply { text = "Jarvis — connect ContextForge"; textSize = 24f; gravity = Gravity.CENTER })
             addView(urlInput)
             addView(tokenInput)
+            addView(relayInput)
             addView(save)
             addView(note)
         }

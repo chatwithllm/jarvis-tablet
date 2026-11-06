@@ -289,10 +289,14 @@ object TokenStore {
     private const val FILE = "jarvis_secure_prefs"
     private const val KEY_URL = "cf_url"
     private const val KEY_TOKEN = "cf_token"
+    private const val KEY_VOICE_RELAY = "voice_relay_url"
 
     /** Default gateway endpoint (LAN, Wi-Fi) — the tablet is on VLAN 20. */
     const val DEFAULT_CF_URL =
         "http://192.168.20.217:4444/servers/a1345fe8da0d4971bd35621e294baed3/mcp"
+
+    /** Default Mini voice relay (mini/voice-relay.py, LAN only). Set in Settings when deployed. */
+    const val DEFAULT_VOICE_RELAY_URL = ""
 
     private fun prefs(context: Context) =
         EncryptedSharedPreferences.create(
@@ -314,10 +318,21 @@ object TokenStore {
     fun getCfToken(context: Context): String? =
         runCatching { prefs(context).getString(KEY_TOKEN, null) }.getOrNull()
 
+    /** Mini voice relay base URL (Phase 2), or null when not configured. */
+    fun getVoiceRelayUrl(context: Context): String? =
+        runCatching { prefs(context).getString(KEY_VOICE_RELAY, null) }
+            .getOrNull()?.trim()?.trimEnd('/')?.ifEmpty { null }
+
     fun save(context: Context, cfUrl: String, cfToken: String) {
         prefs(context).edit()
             .putString(KEY_URL, cfUrl.trim().trimEnd('/'))
             .putString(KEY_TOKEN, cfToken.trim())
+            .apply()
+    }
+
+    fun saveVoiceRelayUrl(context: Context, url: String) {
+        prefs(context).edit()
+            .putString(KEY_VOICE_RELAY, url.trim().trimEnd('/'))
             .apply()
     }
 }

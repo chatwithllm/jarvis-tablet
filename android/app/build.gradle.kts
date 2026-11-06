@@ -47,8 +47,22 @@ val copyHud by tasks.registering(Copy::class) {
     // Never bundle a stray README as an asset page.
     exclude("README.md")
 }
+
+// Bundle the wake-word models: copy wake/*.onnx into the APK assets
+// before every build. wake/ is the source of truth (the trained
+// hey_jack.onnx + the shared openWakeWord melspectrogram/embedding
+// models); android/app/src/main/assets/wake is generated (gitignored).
+// When hey_jack.onnx does not exist yet, the copy is a no-op and
+// WakeModel reports "missing" (normal until Phase 2 training lands).
+val copyWakeModels by tasks.registering(Copy::class) {
+    from(rootProject.file("../wake")) {
+        include("*.onnx")
+    }
+    into(layout.projectDirectory.dir("src/main/assets/wake"))
+}
 tasks.named("preBuild").configure {
     dependsOn(copyHud)
+    dependsOn(copyWakeModels)
 }
 
 dependencies {

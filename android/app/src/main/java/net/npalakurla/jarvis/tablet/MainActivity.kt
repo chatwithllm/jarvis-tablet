@@ -1,6 +1,8 @@
 package net.npalakurla.jarvis.tablet
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.PowerManager
@@ -9,6 +11,8 @@ import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -43,6 +47,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
     private lateinit var bridge: JarvisBridge
     private var heartbeatJob: Job? = null
     private var wakeEnabled = true
+    private lateinit var voiceTurn: VoiceTurn
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -57,7 +62,16 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
         }
 
         buildWebView()
+        voiceTurn = VoiceTurn(
+            this,
+            bridge,
+            MiniRelayTransport(this),
+            isQuietHours = { isQuietHours() },
+        )
+        // A wake word starts a turn (the HUD event goes out too).
+        bridge.onWakeDetected = { voiceTurn.start() }
         maybeRequestBatteryExemption()
+        maybeRequestMicPermission()
         startWakeServiceIfConfigured()
         startHeartbeat()
     }
@@ -138,6 +152,54 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
         startActivity(Intent(this, SettingsActivity::class.java))
     }
 
+    // -- Phase 2: microphone permission (issue #17) ----------------------
+    //
+    // RECORD_AUDIO is a dangerous permission: declaring it in the
+    // manifest is not enough on Android 11 — it must be granted at
+    // runtime. Phase 1 never asked, so the tablet reported
+    // RECORD_AUDIO denied and the wake service could not open the mic.
+    // Ask once on launch; if the user denies, the HUD shows the
+    // mic_permission error (the WakeService sends it too) and
+    // tap-to-talk stays off until the permission is granted in Settings.
+
+    private fun maybeRequestMicPermission() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        ) return
+        ActivityCompat.requestPermissions(
+            this,
+            arrayOf(Manifest.permission.RECORD_AUDIO),
+            REQUEST_MIC_PERMISSION,
+        )
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQUEST_MIC_PERMISSION) return
+        if (grantResults.isNotEmpty() &&
+            grantResults[0] == PackageManager.PERMISSION_GRANTED
+        ) {
+            // Mic granted after launch: start the wake service now if the
+            // hub is configured (it was skipped while the mic was denied).
+            if (TokenStore.hasCredentials(this) && !WakeService.isRunning) {
+                WakeService.start(this)
+            }
+            pushStatus()
+        } else {
+            bridge.sendEvent(
+                "error",
+                JSONObject()
+                    .put("code", "mic_permission")
+                    .put("message", "Microphone permission denied — voice is off. Grant it in Settings to enable Hey Jack and tap-to-talk."),
+            )
+        }
+    }
+
     // -- FR-06: battery-optimization exemption, asked once ---------------
 
     private fun maybeRequestBatteryExemption() {
@@ -191,29 +253,33 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
     // -- JarvisBridge.Host (WebView -> native) ---------------------------
 
     override fun onTalkPressed() {
-        // Phase 2: start the turn-based pipeline (STT -> agent -> TTS).
-        // Phase 1: acknowledge so the HUD can show the listening state.
-        bridge.sendEvent("thinking", JSONObject().put("step", "voice_phase2_pending"))
+        // Phase 2: start the turn-based pipeline (record -> relay ->
+        // STT/agent/TTS -> speak). The wake word also starts a turn
+        // via WakeService -> bridge wake_detected.
+        voiceTurn.start()
     }
 
     override fun onCancel(id: String?) {
         if (id != null) {
             // Cancel a pending confirm: resolve it as declined (FR-24/FR-51).
             PolicyController.resolve(id, confirmed = false, sourceDevice = DEVICE_ID)
+            voiceTurn.onConfirmResolved(id, false)
             bridge.sendEvent(
                 "confirm_resolved",
                 JSONObject().put("id", id).put("outcome", "declined"),
             )
         } else {
             // Cancel the current turn (orb tapped while listening).
-            bridge.sendEvent("thinking", JSONObject().put("step", "cancelled"))
+            voiceTurn.cancel()
         }
     }
 
     override fun onConfirmYes(id: String) {
         // Phase 2: PolicyController.resolve enforces source binding
-        // (FR-55) and the 10 s expiry (FR-24/FR-51).
+        // (FR-55) and the 10 s expiry (FR-24/FR-51). The waiting turn
+        // learns the outcome and executes the action if confirmed.
         val ok = PolicyController.resolve(id, confirmed = true, sourceDevice = DEVICE_ID)
+        voiceTurn.onConfirmResolved(id, ok)
         bridge.sendEvent(
             "confirm_resolved",
             JSONObject().put("id", id)
@@ -223,6 +289,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
 
     override fun onConfirmNo(id: String) {
         PolicyController.resolve(id, confirmed = false, sourceDevice = DEVICE_ID)
+        voiceTurn.onConfirmResolved(id, false)
         bridge.sendEvent(
             "confirm_resolved",
             JSONObject().put("id", id).put("outcome", "declined"),
@@ -289,5 +356,8 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
     companion object {
         /** This device's id for FR-55 source binding of confirmations. */
         const val DEVICE_ID = "lenovo-tab-p11"
+
+        /** Request code for the runtime RECORD_AUDIO permission (Phase 2). */
+        const val REQUEST_MIC_PERMISSION = 1001
     }
 }

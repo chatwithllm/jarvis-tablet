@@ -407,6 +407,16 @@ def main():
     with zipfile.ZipFile(unsigned, "a", zipfile.ZIP_DEFLATED) as z:
         for dex in dex_files:
             z.write(dex, os.path.basename(dex))
+    # wake-word models: copy wake/*.onnx into assets/wake/ (mirrors the
+    # copyWakeModels Gradle task). When hey_jack.onnx does not exist yet
+    # the copy is a no-op and WakeModel reports "missing".
+    wake_src = os.path.join(ROOT, "wake")
+    wake_dst = os.path.join(APP, "src", "main", "assets", "wake")
+    if os.path.isdir(wake_src):
+        os.makedirs(wake_dst, exist_ok=True)
+        for fn in sorted(os.listdir(wake_src)):
+            if fn.endswith(".onnx"):
+                shutil.copyfile(os.path.join(wake_src, fn), os.path.join(wake_dst, fn))
     # bundled HUD assets (src/main/assets/**)
     assets_root = os.path.join(APP, "src", "main", "assets")
     with zipfile.ZipFile(unsigned, "a", zipfile.ZIP_DEFLATED) as z:

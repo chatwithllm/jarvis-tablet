@@ -17,6 +17,12 @@ android/local.properties
 # into assets/hud/). The HUD source itself lives in
 # android/app/src/main/assets/web/ and IS tracked.
 android/app/src/main/assets/hud/
+# Generated wake-model assets (rebuilt by the copyWakeModels Gradle
+# task from wake/*.onnx into assets/wake/). The models in wake/ ARE
+# tracked; the venv used to train them is not.
+android/app/src/main/assets/wake/
+wake/venv/
+mini/__pycache__/
 
 # Downloaded Android dependencies (reproducible: android/libs/resolve.py
 # + resolved.txt re-download them). Keep resolve.py + resolved.txt.

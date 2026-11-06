@@ -28,6 +28,9 @@ class JarvisBridge(
     private val webView: WebView,
 ) {
 
+    /** Phase 2: invoked when a wake word fires (before the HUD event). MainActivity starts the turn. */
+    var onWakeDetected: (() -> Unit)? = null
+
     interface Host {
         fun onTalkPressed()
         fun onConfirmYes(id: String)
@@ -64,6 +67,7 @@ class JarvisBridge(
 
     /** Native -> WebView: one event object, dispatched to window.Jarvis. */
     fun sendEvent(type: String, payload: JSONObject) {
+        if (type == "wake_detected") onWakeDetected?.invoke()
         val envelope = JSONObject().apply {
             put("type", type)
             put("ts", System.currentTimeMillis())
