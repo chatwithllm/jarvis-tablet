@@ -184,9 +184,18 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
         if (grantResults.isNotEmpty() &&
             grantResults[0] == PackageManager.PERMISSION_GRANTED
         ) {
-            // Mic granted after launch: start the wake service now if the
-            // hub is configured (it was skipped while the mic was denied).
-            if (TokenStore.hasCredentials(this) && !WakeService.isRunning) {
+            // Mic granted after launch: the wake service must (re)start now
+            // so its AudioRecord opens. If the service already started
+            // before the grant, its startMicLoop() returned early (no
+            // permission) and the service is running with no recorder —
+            // the old `!isRunning` guard skipped the restart, so the mic
+            // never opened until a force-stop + relaunch (issue #18).
+            // Restart it so onCreate() -> startMicLoop() runs again with
+            // the permission granted and opens the AudioRecord.
+            if (TokenStore.hasCredentials(this)) {
+                if (WakeService.isRunning) {
+                    WakeService.stop(this)
+                }
                 WakeService.start(this)
             }
             pushStatus()
