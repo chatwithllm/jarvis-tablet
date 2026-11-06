@@ -42,6 +42,32 @@ jobs:
           # 'tools'", issue #1). v4 defaults to platform-tools only, so
           # install the platform + build-tools Gradle needs explicitly.
           packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
+      # Issues #8 / #14: every CI run used to sign the debug APK with a
+      # fresh auto-generated debug key (a new ubuntu-latest runner has no
+      # ~/.android/debug.keystore), so `adb install -r` failed with
+      # INSTALL_FAILED_UPDATE_INCOMPATIBLE on every new build — and the
+      # 9fb16b3 retest is blocked because wiping would destroy the saved
+      # ContextForge bearer. AGP signs debug builds with
+      # ~/.android/debug.keystore when it already exists, so restore one
+      # stable key from the DEBUG_KEYSTORE_BASE64 repo secret (see
+      # docs/signing.md for the one-time setup). This step FAILS HARD when
+      # the secret is missing, so a missing secret can never silently
+      # ship another mismatched APK.
+      - name: Restore stable debug keystore (issues #8/#14)
+        env:
+          DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$DEBUG_KEYSTORE_BASE64" ]; then
+            echo "ERROR: DEBUG_KEYSTORE_BASE64 secret is not set."
+            echo "See docs/signing.md — generate the debug keystore once and"
+            echo "add it as a repo secret, then re-run this workflow."
+            exit 1
+          fi
+          mkdir -p ~/.android
+          echo "$DEBUG_KEYSTORE_BASE64" | base64 -d > ~/.android/debug.keystore
+          keytool -list -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey >/dev/null \
+            || { echo "ERROR: decoded keystore is invalid (expected alias androiddebugkey, storepass android)"; exit 1; }
+          echo "stable debug keystore restored"
       - uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: "8.7"
