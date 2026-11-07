@@ -11,8 +11,8 @@ android {
         applicationId = "net.npalakurla.jarvis.tablet"
         minSdk = 30 // Lenovo TB-J606F runs Android 11 (API 30)
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0-phase1"
+        versionCode = 2
+        versionName = "0.4.0-phase4"
     }
 
     // Issue #18: the debug build type had NO explicit signingConfig,

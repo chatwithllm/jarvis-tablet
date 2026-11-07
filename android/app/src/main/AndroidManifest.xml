@@ -16,6 +16,18 @@
 
     <uses-feature android:name="android.hardware.microphone" android:required="true" />
 
+    <!-- Android 11 package visibility. SpeechRecognizer and TextToSpeech
+         bind platform engines by intent action. Without these queries the
+         direct voice path cannot see them (API 30+). -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="false"
         android:icon="@drawable/ic_launcher"

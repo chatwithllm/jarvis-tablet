@@ -42,8 +42,8 @@ JAVA_HOME = os.environ.get("JAVA_HOME") or os.path.expanduser("~/workspace/.jdk1
 KOTLINC_HOME = os.environ.get("KOTLINC_HOME") or os.path.expanduser("~/workspace/.kotlin/kotlinc")
 
 PACKAGE = "net.npalakurla.jarvis.tablet"
-VERSION_CODE = "1"
-VERSION_NAME = "0.1.0-phase1"
+VERSION_CODE = "2"
+VERSION_NAME = "0.4.0-phase4"
 MIN_SDK = "30"
 TARGET_SDK = "34"
 
@@ -386,6 +386,9 @@ def main():
     required_dex_classes = [
         "Landroidx/appcompat/R$drawable;",
         "Lnet/npalakurla/jarvis/tablet/MainActivity;",
+        "Lnet/npalakurla/jarvis/tablet/ContextForgeLlmTransport;",
+        "Lnet/npalakurla/jarvis/tablet/DeviceSpeech;",
+        "Lnet/npalakurla/jarvis/tablet/RoutingVoiceTransport;",
         "Landroidx/appcompat/app/AppCompatActivity;",
         "Landroidx/webkit/WebViewCompat;",
         "Lai/onnxruntime/OrtEnvironment;",

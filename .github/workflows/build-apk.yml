@@ -98,7 +98,10 @@ jobs:
           # every classes*.dex, not just the first.
           dexdump="$ANDROID_HOME/build-tools/34.0.0/dexdump"
           mkdir -p /tmp/dexcheck && cd /tmp/dexcheck && unzip -o -q "$GITHUB_WORKSPACE/android/$apk" 'classes*.dex'
-          for cls in 'Landroidx/appcompat/R$drawable;' 'Lnet/npalakurla/jarvis/tablet/MainActivity;'; do
+          for cls in 'Landroidx/appcompat/R$drawable;' 'Lnet/npalakurla/jarvis/tablet/MainActivity;' \
+            'Lnet/npalakurla/jarvis/tablet/ContextForgeLlmTransport;' \
+            'Lnet/npalakurla/jarvis/tablet/DeviceSpeech;' \
+            'Lnet/npalakurla/jarvis/tablet/RoutingVoiceTransport;'; do
             found=0
             for dex in classes*.dex; do
               if "$dexdump" -f "$dex" 2>/dev/null | grep "Class descriptor" | grep -q -F "$cls"; then found=1; break; fi

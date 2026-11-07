@@ -10,37 +10,44 @@ import android.media.MediaRecorder
 import android.util.Base64
 import android.util.Log
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import kotlin.coroutines.coroutineContext
 import kotlin.math.sqrt
 
 /**
- * Phase 2 — turn-based voice (PRD v2.2: HA Assist + Grok HACS, local
- * Whisper + Piper, via the Mini voice relay).
+ * Turn-based voice (PRD v2.2 FR-24/25/26).
  *
- * The tablet never talks to Home Assistant directly and never holds a
- * raw HA token (issue #13). Audio goes to the Mini voice relay
- * (mini/voice-relay.py, LAN only), which holds the HA token and runs
- * the HA Assist pipeline (Whisper STT -> Grok HACS agent -> Piper TTS).
- * The relay returns the transcript, the response text, TTS audio, and
- * any action the agent proposed. Proposed actions go through
- * [PolicyController] (confirm card, 10 s timeout, source binding) —
- * the relay never executes a service call on its own; the tablet
- * sends the execute call only after the originating device confirms.
+ * Two transports, picked per turn by [RoutingVoiceTransport]:
+ * - Direct: on-device [DeviceSpeech] (SpeechRecognizer + TextToSpeech)
+ *   and ContextForge `POST /llm/v1/chat/completions`, when the
+ *   `cf-jarvis-tablet-llm` bearer is saved.
+ * - Fallback: the Mini voice relay (`POST /voice/turn`), which still
+ *   runs Whisper + the HA Assist pipeline + Piper. Used when the LLM
+ *   bearer is missing, speech recognition cannot start, or the direct
+ *   call fails (401/403, unreachable). A failed direct attempt listens
+ *   a second time for the relay — the recognizer already consumed the
+ *   first utterance, and the relay needs WAV audio.
+ *
+ * Proposed actions go through [PolicyController] (confirm card, spoken
+ * yes or tap, 10 s timeout = cancel, source binding). Locks, garage,
+ * and alarm are refused. The tablet never holds a raw HA token.
  *
  * Turn states: idle -> recording -> thinking -> speaking -> idle.
- * End of speech: 1.5 s of silence after speech, or 10 s max.
  * TTS volume: 20% during quiet hours (FR-26), full otherwise.
- * No audio is stored on the tablet; the recording buffer is dropped
- * when the turn ends. No audio is ever logged.
+ * No audio is stored on the tablet. No audio is ever logged.
  */
 class VoiceTurn(
     private val context: Context,
@@ -49,11 +56,11 @@ class VoiceTurn(
     private val isQuietHours: () -> Boolean,
 ) {
 
-    /** One turn's result from the relay. */
+    /** One turn's result from the relay or the direct client. */
     data class TurnResult(
         val transcript: String,
         val responseText: String,
-        /** TTS audio as WAV bytes (Piper output), or null when there is none. */
+        /** TTS audio as WAV bytes (Piper output), or null when the device speaks the text. */
         val ttsAudio: ByteArray?,
         /** Action the agent proposed (null for read-only answers). */
         val proposedAction: ProposedAction?,
@@ -66,20 +73,39 @@ class VoiceTurn(
         val entityId: String,
         val newState: String,
         val room: String?,
+        /** HA service to run after confirm. Null on the relay path (the Mini stored it). */
+        val service: String? = null,
     )
 
-    /** The relay behind the turn. Swappable (e.g. a ContextForge conversation tool later). */
+    /**
+     * The voice backend behind a turn. [MiniRelayTransport] speaks WAV.
+     * [RoutingVoiceTransport] adds the direct text path.
+     */
     interface Transport {
+        /** True when the LLM bearer is saved and this turn should try ContextForge first. */
+        fun preferDirect(): Boolean = false
+
         suspend fun runTurn(audioWav: ByteArray): Result<TurnResult>
+
+        /** Direct path: transcript already recognized on the device. */
+        suspend fun completeText(transcript: String): Result<TurnResult> =
+            Result.failure(IllegalStateException("text transport not available"))
+
         suspend fun executeAction(actionId: String): Result<Unit>
+
+        /** Drop a proposed action that was not confirmed. */
+        fun discardAction(actionId: String) {}
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + Job())
+    private val deviceSpeech = DeviceSpeech(context)
     private var turnJob: Job? = null
     private var recorder: AudioRecord? = null
     @Volatile private var recording = false
+    private val confirmLock = Any()
     private var pendingConfirm: CompletableDeferred<Boolean>? = null
     private var pendingConfirmId: String? = null
+    @Volatile private var confirmOpen = false
 
     @Volatile var isActive: Boolean = false
         private set
@@ -105,8 +131,10 @@ class VoiceTurn(
         turnJob = scope.launch {
             try {
                 runTurn()
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                Log.w("VoiceTurn", "turn failed: ${e.message}")
+                Log.w(TAG, "turn failed: ${e.javaClass.simpleName}")
                 bridge.sendEvent(
                     "error",
                     JSONObject()
@@ -115,7 +143,8 @@ class VoiceTurn(
                 )
             } finally {
                 WakeService.muteTailMs = 0L
-                isActive = false
+                // Inside launch {}, bare isActive is CoroutineScope.isActive (a val).
+                this@VoiceTurn.isActive = false
             }
         }
     }
@@ -123,9 +152,16 @@ class VoiceTurn(
     /** Cancel the current turn (orb tapped while listening, or Back). */
     fun cancel() {
         recording = false
+        confirmOpen = false
         turnJob?.cancel()
         isActive = false
         bridge.sendEvent("thinking", JSONObject().put("step", "cancelled"))
+    }
+
+    /** Release the speech engine. MainActivity calls this from onDestroy. */
+    fun close() {
+        cancel()
+        deviceSpeech.shutdown()
     }
 
     /**
@@ -134,116 +170,326 @@ class VoiceTurn(
      * can execute (confirmed) or skip (declined/expired) the action.
      */
     fun onConfirmResolved(id: String, confirmed: Boolean) {
-        if (id == pendingConfirmId) {
-            pendingConfirm?.complete(confirmed)
-            pendingConfirm = null
-            pendingConfirmId = null
+        synchronized(confirmLock) {
+            if (id != pendingConfirmId) return
+            val waiting = pendingConfirm ?: return
+            if (!waiting.isCompleted) waiting.complete(confirmed)
         }
     }
 
     private suspend fun runTurn() {
-        val audio = recordUntilSilence() ?: return
+        bridge.sendEvent("thinking", JSONObject().put("step", "listening"))
+        if (!transport.preferDirect()) {
+            finishRelay(relayTurn(announce = false), directError = null)
+            return
+        }
+        val heard = try {
+            deviceSpeech.listen(
+                onPartial = { text ->
+                    bridge.sendEvent("transcript_partial", JSONObject().put("text", text))
+                },
+                onLevel = { level ->
+                    bridge.sendEvent("listening_level", JSONObject().put("level", level))
+                },
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "listen failed: ${e.javaClass.simpleName}")
+            DeviceSpeech.ListenResult(null, "client")
+        }
+        val transcript = heard.transcript?.trim().orEmpty()
+        if (transcript.isNotEmpty()) {
+            bridge.sendEvent("thinking", JSONObject().put("step", "transcribing"))
+            val direct = transport.completeText(transcript)
+            if (direct.isSuccess) {
+                present(direct.getOrThrow())
+                return
+            }
+            Log.w(TAG, "direct llm failed: ${direct.exceptionOrNull()?.message}")
+            finishRelay(relayTurn(announce = true), direct.exceptionOrNull())
+            return
+        }
+        if (isSilence(heard.error)) {
+            // Recognizer ran and nobody spoke. Don't open a second listen.
+            bridge.sendEvent("tts_finished", JSONObject())
+            return
+        }
+        Log.w(TAG, "direct stt failed: ${heard.error}")
+        finishRelay(relayTurn(announce = true), IllegalStateException("stt ${heard.error}"))
+    }
+
+    private suspend fun finishRelay(attempt: RelayAttempt, directError: Throwable?) {
+        when (attempt) {
+            RelayAttempt.Presented, RelayAttempt.Silent -> Unit
+            RelayAttempt.Unconfigured -> {
+                bridge.sendEvent(
+                    "error",
+                    JSONObject()
+                        .put("code", if (directError == null) "ha_unreachable" else "stt_failed")
+                        .put("message", unconfiguredMessage(directError)),
+                )
+            }
+            is RelayAttempt.Failed -> {
+                Log.w(TAG, "relay failed: ${attempt.error.message}")
+                bridge.sendEvent(
+                    "error",
+                    JSONObject()
+                        .put("code", "ha_unreachable")
+                        .put(
+                            "message",
+                            if (directError != null) {
+                                "Voice failed on ContextForge and the Mini relay."
+                            } else {
+                                "Could not reach the voice relay. Check the Mini."
+                            },
+                        ),
+                )
+            }
+        }
+    }
+
+    private fun unconfiguredMessage(directError: Throwable?): String {
+        if (directError == null) {
+            return "No LLM token and no Mini relay URL. Set one of them in Settings."
+        }
+        val msg = directError.message.orEmpty()
+        return if (msg.contains("401") || msg.contains("403")) {
+            "The LLM token was rejected. Check the cf-jarvis-tablet-llm bearer in Settings."
+        } else if (msg.startsWith("stt ")) {
+            "Speech recognition is unavailable, and no Mini relay is configured."
+        } else {
+            "Could not reach ContextForge, and no Mini relay is configured."
+        }
+    }
+
+    private sealed class RelayAttempt {
+        data object Presented : RelayAttempt()
+        data object Silent : RelayAttempt()
+        data object Unconfigured : RelayAttempt()
+        data class Failed(val error: Throwable) : RelayAttempt()
+    }
+
+    /**
+     * Record one utterance and send it to the Mini relay.
+     * [announce] is set when this is the fallback after a direct-path
+     * failure, so the person knows to speak again.
+     */
+    private suspend fun relayTurn(announce: Boolean): RelayAttempt {
+        if (TokenStore.getVoiceRelayUrl(context) == null) return RelayAttempt.Unconfigured
+        if (announce) {
+            bridge.sendEvent("thinking", JSONObject().put("step", "relay_listen"))
+        }
+        val audio = recordUntilSilence() ?: run {
+            bridge.sendEvent("tts_finished", JSONObject())
+            return RelayAttempt.Silent
+        }
         bridge.sendEvent("thinking", JSONObject().put("step", "transcribing"))
-        val result = transport.runTurn(audio).getOrElse {
+        val result = transport.runTurn(audio)
+        val value = result.getOrElse { return RelayAttempt.Failed(it) }
+        present(value)
+        return RelayAttempt.Presented
+    }
+
+    private suspend fun present(result: TurnResult) {
+        if (result.transcript.isNotBlank()) {
+            bridge.sendEvent(
+                "transcript_final",
+                JSONObject().put("text", result.transcript),
+            )
+        }
+        val action = result.proposedAction
+        val outcome = if (action != null) confirmAction(action) else null
+        if (action != null && outcome != "confirmed") transport.discardAction(action.id)
+        val text = when (outcome) {
+            null -> result.responseText
+            "confirmed" -> result.responseText.ifBlank { "Confirmed." }
+            "declined" -> "Cancelled."
+            "refused" -> "That is not allowed by voice."
+            else -> ""
+        }
+        // Piper audio is the model's reply. After a no / refusal / failed
+        // execute, don't play it — it may claim the change already happened.
+        val wav = if (outcome == null || outcome == "confirmed") result.ttsAudio else null
+        speakResponse(text, wav)
+    }
+
+    /**
+     * Confirm gate (FR-24/25/55). Returns confirmed, declined, refused,
+     * or failed (confirmed, but the execute call did not succeed).
+     */
+    private suspend fun confirmAction(action: ProposedAction): String {
+        val pending = PolicyController.propose(
+            summary = action.summary,
+            domain = action.domain,
+            entityId = action.entityId,
+            newState = action.newState,
+            sourceDevice = MainActivity.DEVICE_ID,
+            service = action.service,
+        )
+        if (pending == null) {
+            bridge.sendEvent(
+                "refused",
+                JSONObject()
+                    .put("reason", "denied")
+                    .put("message", "That is not allowed by voice."),
+            )
+            bridge.sendEvent(
+                "confirm_resolved",
+                JSONObject().put("id", action.id).put("outcome", "refused"),
+            )
+            return "refused"
+        }
+        bridge.sendEvent(
+            "confirm_requested",
+            JSONObject().apply {
+                put("id", pending.id)
+                put(
+                    "action",
+                    JSONObject().apply {
+                        put("summary", pending.summary)
+                        put("domain", pending.domain)
+                        put("entity_id", pending.entityId)
+                        put("new_state", pending.newState)
+                        action.room?.let { put("room", it) }
+                    },
+                )
+                put("expiry", PolicyController.CONFIRM_TIMEOUT_MS / 1000)
+            },
+        )
+        val deferred = CompletableDeferred<Boolean>()
+        synchronized(confirmLock) {
+            pendingConfirm = deferred
+            pendingConfirmId = pending.id
+            confirmOpen = true
+        }
+        val confirmed = coroutineScope {
+            val listenJob = launch {
+                try {
+                    listenForSpokenConfirm(pending.id, pending.createdAtMs)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "confirm listen failed: ${e.javaClass.simpleName}")
+                }
+            }
+            try {
+                val remaining = (
+                    pending.createdAtMs + PolicyController.CONFIRM_TIMEOUT_MS -
+                        System.currentTimeMillis()
+                    ).coerceAtLeast(0L)
+                withTimeoutOrNull(remaining) { deferred.await() } ?: false
+            } finally {
+                listenJob.cancel()
+                synchronized(confirmLock) {
+                    confirmOpen = false
+                    if (!deferred.isCompleted) {
+                        PolicyController.resolve(
+                            pending.id,
+                            confirmed = false,
+                            sourceDevice = MainActivity.DEVICE_ID,
+                        )
+                    }
+                    pendingConfirm = null
+                    pendingConfirmId = null
+                }
+            }
+        }
+        if (!confirmed) {
+            bridge.sendEvent(
+                "confirm_resolved",
+                JSONObject().put("id", pending.id).put("outcome", "declined"),
+            )
+            return "declined"
+        }
+        val executed = transport.executeAction(action.id)
+        if (executed.isFailure) {
+            Log.w(TAG, "execute failed: ${executed.exceptionOrNull()?.message}")
             bridge.sendEvent(
                 "error",
                 JSONObject()
                     .put("code", "ha_unreachable")
-                    .put("message", "Could not reach the voice relay. Check the Mini."),
+                    .put("message", "Confirmed, but the action could not run."),
             )
-            return
+            return "failed"
         }
         bridge.sendEvent(
-            "transcript_final",
-            JSONObject().put("text", result.transcript),
+            "confirm_resolved",
+            JSONObject().put("id", pending.id).put("outcome", "confirmed"),
         )
-        // A proposed action goes through the confirm gate first.
-        val action = result.proposedAction
-        if (action != null) {
-            val pending = PolicyController.propose(
-                summary = action.summary,
-                domain = action.domain,
-                entityId = action.entityId,
-                newState = action.newState,
-                sourceDevice = MainActivity.DEVICE_ID,
-            )
-            if (pending == null) {
-                // Hard denylist (lock / alarm / garage, FR-25).
-                bridge.sendEvent(
-                    "refused",
-                    JSONObject()
-                        .put("reason", "denied")
-                        .put("message", "That is not allowed by voice."),
-                )
-                bridge.sendEvent(
-                    "confirm_resolved",
-                    JSONObject().put("id", action.id).put("outcome", "refused"),
-                )
-            } else {
-                bridge.sendEvent(
-                    "confirm_requested",
-                    JSONObject().apply {
-                        put("id", pending.id)
-                        put(
-                            "action",
-                            JSONObject().apply {
-                                put("summary", pending.summary)
-                                put("domain", pending.domain)
-                                put("entity_id", pending.entityId)
-                                put("new_state", pending.newState)
-                                action.room?.let { put("room", it) }
-                            },
-                        )
-                        put("expiry", PolicyController.CONFIRM_TIMEOUT_MS / 1000)
-                    },
-                )
-                // Wait for the originating device's yes/no (10 s, FR-24).
-                val deferred = CompletableDeferred<Boolean>()
-                pendingConfirm = deferred
-                pendingConfirmId = pending.id
-                val confirmed = withTimeoutOrNull(PolicyController.CONFIRM_TIMEOUT_MS) {
-                    deferred.await()
-                } ?: false
-                pendingConfirm = null
-                pendingConfirmId = null
-                if (confirmed) {
-                    transport.executeAction(action.id).getOrElse {
-                        bridge.sendEvent(
-                            "error",
-                            JSONObject()
-                                .put("code", "ha_unreachable")
-                                .put("message", "Confirmed, but the action could not run."),
-                        )
-                        return
-                    }
-                    bridge.sendEvent(
-                        "confirm_resolved",
-                        JSONObject().put("id", pending.id).put("outcome", "confirmed"),
-                    )
-                } else {
-                    bridge.sendEvent(
-                        "confirm_resolved",
-                        JSONObject().put("id", pending.id).put("outcome", "declined"),
-                    )
+        return "confirmed"
+    }
+
+    /** Listen for a short yes/no until the confirm window closes (FR-24). Tap still works. */
+    private suspend fun listenForSpokenConfirm(policyId: String, createdAtMs: Long) {
+        WakeService.pauseMic()
+        try {
+            val deadline = createdAtMs + PolicyController.CONFIRM_TIMEOUT_MS
+            while (coroutineContext.isActive && System.currentTimeMillis() < deadline) {
+                val stillOpen = synchronized(confirmLock) {
+                    confirmOpen && pendingConfirmId == policyId
                 }
+                if (!stillOpen) return
+                val remaining = deadline - System.currentTimeMillis()
+                if (remaining <= 0L) return
+                val heard = deviceSpeech.listen(
+                    timeoutMs = remaining.coerceAtMost(8_000L),
+                    manageWakeMic = false,
+                )
+                val said = heard.transcript?.let { interpretConfirm(it) }
+                if (said != null) {
+                    acceptSpokenConfirm(policyId, said)
+                    return
+                }
+                if (heard.error == "recognizer_unavailable" ||
+                    heard.error == "permissions" ||
+                    heard.error == "client"
+                ) {
+                    return
+                }
+                delay(250)
             }
-        }
-        // Speak the response (if any), at quiet-hours volume when set.
-        val tts = result.ttsAudio
-        if (tts != null) {
-            bridge.sendEvent(
-                "tts_started",
-                JSONObject().put("text", result.responseText),
-            )
-            playPcm(tts)
-            bridge.sendEvent("tts_finished", JSONObject())
-        } else if (result.responseText.isNotBlank()) {
-            bridge.sendEvent(
-                "transcript_final",
-                JSONObject().put("text", result.responseText),
-            )
+        } finally {
+            WakeService.resumeMic()
         }
     }
+
+    private fun acceptSpokenConfirm(policyId: String, saidYes: Boolean) {
+        synchronized(confirmLock) {
+            if (!confirmOpen || pendingConfirmId != policyId) return
+            val waiting = pendingConfirm ?: return
+            if (waiting.isCompleted) return
+            val accepted = PolicyController.resolve(
+                policyId,
+                confirmed = saidYes,
+                sourceDevice = MainActivity.DEVICE_ID,
+            )
+            if (!accepted) return
+            waiting.complete(saidYes)
+        }
+    }
+
+    private suspend fun speakResponse(text: String, wav: ByteArray?) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty() && wav == null) {
+            bridge.sendEvent("tts_finished", JSONObject())
+            return
+        }
+        bridge.sendEvent("tts_started", JSONObject().put("text", trimmed))
+        try {
+            if (wav != null) {
+                playPcm(wav)
+            } else {
+                // FR-26: quiet hours 21:00-07:00 at 20% volume.
+                deviceSpeech.speak(trimmed.take(600), if (isQuietHours()) 0.2f else 1.0f)
+            }
+        } finally {
+            bridge.sendEvent("tts_finished", JSONObject())
+        }
+    }
+
+    private fun isSilence(error: String?): Boolean =
+        error == null || error == "no_match" || error == "speech_timeout" || error == "timeout"
 
     /**
      * Record until 1.5 s of silence after speech, or 10 s max.
@@ -276,6 +522,7 @@ class VoiceTurn(
                 val read = rec.read(frame, 0, FRAME_SAMPLES)
                 if (read <= 0) continue
                 val level = rmsLevel(frame, read)
+                bridge.sendEvent("listening_level", JSONObject().put("level", level))
                 // Speech threshold: above the room-noise floor.
                 if (level > SPEECH_LEVEL) {
                     heardSpeech = true
@@ -305,6 +552,7 @@ class VoiceTurn(
     /** Play 16-bit 16 kHz PCM WAV bytes via AudioTrack. */
     private fun playPcm(wav: ByteArray) {
         val pcm = wavToPcm(wav) ?: return
+        if (pcm.isEmpty()) return
         val track = AudioTrack.Builder()
             .setAudioAttributes(
                 android.media.AudioAttributes.Builder()
@@ -320,14 +568,18 @@ class VoiceTurn(
                     .build(),
             )
             .setTransferMode(AudioTrack.MODE_STATIC)
-            .setBufferSizeInBytes(pcm.size)
+            .setBufferSizeInBytes(pcm.size.coerceAtLeast(2))
             .build()
         // FR-26: quiet hours 21:00-07:00 at 20% volume.
         track.setVolume(if (isQuietHours()) 0.2f else 1.0f)
         track.write(pcm, 0, pcm.size)
         track.play()
         // Block until playback finishes (static mode: position == size).
+        // Cap the wait so a stuck track cannot hold the turn open.
+        val maxMs = (pcm.size / 2 * 1000L / SAMPLE_RATE) + 2_000L
+        val started = System.currentTimeMillis()
         while (track.playbackHeadPosition < pcm.size / 2) {
+            if (System.currentTimeMillis() - started > maxMs) break
             Thread.sleep(50)
         }
         track.stop()
@@ -381,12 +633,18 @@ class VoiceTurn(
     }
 
     private fun intLE(v: Int): ByteArray =
-        byteArrayOf((v and 0xFF).toByte(), ((v shr 8) and 0xFF).toByte(), ((v shr 16) and 0xFF).toByte(), ((v shr 24) and 0xFF).toByte())
+        byteArrayOf(
+            (v and 0xFF).toByte(),
+            ((v shr 8) and 0xFF).toByte(),
+            ((v shr 16) and 0xFF).toByte(),
+            ((v shr 24) and 0xFF).toByte(),
+        )
 
     private fun shortLE(v: Int): ByteArray =
         byteArrayOf((v and 0xFF).toByte(), ((v shr 8) and 0xFF).toByte())
 
     companion object {
+        private const val TAG = "VoiceTurn"
         const val SAMPLE_RATE = 16_000
         const val FRAME_SAMPLES = 1_280 // 80 ms @ 16 kHz
         const val FRAME_MS = 80L
@@ -400,7 +658,7 @@ class VoiceTurn(
 }
 
 /**
- * The Mini voice relay transport (mini/voice-relay.py, LAN only).
+ * The Mini voice relay transport (mini/jarvis-mini.py, LAN only).
  * POSTs the turn audio as a WAV and parses the relay's JSON reply.
  * The relay URL is configured in Settings (TokenStore.voiceRelayUrl);
  * the relay holds the HA token, never the tablet.
@@ -440,6 +698,7 @@ class MiniRelayTransport(private val context: Context) : VoiceTurn.Transport {
                             entityId = it.optString("entity_id", ""),
                             newState = it.optString("new_state", ""),
                             room = it.optString("room", "").ifEmpty { null },
+                            service = it.optString("service", "").ifEmpty { null },
                         )
                     },
                 )
@@ -466,4 +725,30 @@ class MiniRelayTransport(private val context: Context) : VoiceTurn.Transport {
                 conn.disconnect()
             }
         }
+}
+
+/**
+ * Prefer the direct ContextForge client when the LLM bearer is saved.
+ * [VoiceTurn] falls back to [MiniRelayTransport] itself when [completeText]
+ * fails; this class only routes execute/discard to whoever created the
+ * action id. Relay audio turns always go to the Mini.
+ */
+class RoutingVoiceTransport(private val context: Context) : VoiceTurn.Transport {
+    private val relay = MiniRelayTransport(context)
+    private val direct = ContextForgeLlmTransport(context)
+
+    override fun preferDirect(): Boolean = TokenStore.hasLlmCredentials(context)
+
+    override suspend fun runTurn(audioWav: ByteArray): Result<VoiceTurn.TurnResult> =
+        relay.runTurn(audioWav)
+
+    override suspend fun completeText(transcript: String): Result<VoiceTurn.TurnResult> =
+        direct.complete(transcript)
+
+    override suspend fun executeAction(actionId: String): Result<Unit> =
+        if (direct.owns(actionId)) direct.execute(actionId) else relay.executeAction(actionId)
+
+    override fun discardAction(actionId: String) {
+        direct.discard(actionId)
+    }
 }

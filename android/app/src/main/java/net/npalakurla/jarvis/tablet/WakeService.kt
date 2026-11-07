@@ -35,6 +35,8 @@ class WakeService : Service() {
     private var recorder: AudioRecord? = null
     private var worker: Thread? = null
     @Volatile private var running = false
+    private val micLock = Any()
+    @Volatile private var micYielded = false
 
     override fun onCreate() {
         super.onCreate()
@@ -49,6 +51,7 @@ class WakeService : Service() {
                 .build(),
         )
         isRunning = true
+        instance = this
         startMicLoop()
     }
 
@@ -59,12 +62,48 @@ class WakeService : Service() {
     }
 
     override fun onDestroy() {
-        running = false
-        worker?.join(500)
-        recorder?.release()
-        recorder = null
-        isRunning = false
+        synchronized(micLock) {
+            running = false
+            micYielded = false
+            val rec = recorder
+            // stop() unblocks AudioRecord.read so the worker can exit.
+            runCatching { rec?.stop() }
+            worker?.join(500)
+            runCatching { rec?.release() }
+            recorder = null
+            worker = null
+            isRunning = false
+            if (instance === this) instance = null
+        }
         super.onDestroy()
+    }
+
+    /**
+     * Release the microphone so [DeviceSpeech] can bind the platform
+     * recognizer. The wake loop is restarted by [resumeMicInternal].
+     * Safe to call when the mic was never opened.
+     */
+    private fun pauseMicInternal() {
+        synchronized(micLock) {
+            if (recorder == null && worker == null) return
+            running = false
+            val rec = recorder
+            runCatching { rec?.stop() }
+            worker?.join(800)
+            runCatching { rec?.release() }
+            recorder = null
+            worker = null
+            micYielded = true
+        }
+    }
+
+    private fun resumeMicInternal() {
+        synchronized(micLock) {
+            if (!micYielded) return
+            micYielded = false
+            if (!isRunning) return
+            startMicLoop()
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -81,6 +120,13 @@ class WakeService : Service() {
     }
 
     private fun startMicLoop() {
+        synchronized(micLock) {
+            startMicLoopLocked()
+        }
+    }
+
+    private fun startMicLoopLocked() {
+        if (recorder != null) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
@@ -154,6 +200,18 @@ class WakeService : Service() {
 
         /** Set by MainActivity; the service only ever *sends* bridge events. */
         @Volatile var listener: JarvisBridge? = null
+
+        @Volatile private var instance: WakeService? = null
+
+        /** Let a voice turn use the mic. No-op when the service is not running. */
+        fun pauseMic() {
+            instance?.pauseMicInternal()
+        }
+
+        /** Start the wake recorder again after [pauseMic], if it was stopped. */
+        fun resumeMic() {
+            instance?.resumeMicInternal()
+        }
 
         fun start(context: Context) {
             ContextCompat.startForegroundService(

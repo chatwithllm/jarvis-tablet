@@ -50,12 +50,30 @@ object PolicyController {
     private val pending = ConcurrentHashMap<String, PendingAction>()
     private val audit = ArrayDeque<AuditEntry>()
 
-    /** Hard denylist (FR-25). Garage = cover with garage device class. */
-    fun isRefused(domain: String, entityId: String, deviceClass: String? = null): Boolean {
-        if (domain in refusedDomains) return true
-        if (domain == "cover" &&
+    /**
+     * Hard denylist (FR-25). Garage = cover with garage device class.
+     * The entity id's own domain counts too, so a spoofed `domain`
+     * cannot sneak a `lock.*` or `alarm_control_panel.*` past the check.
+     * Lock/unlock/alarm service names are refused even if the domain
+     * looks harmless.
+     */
+    fun isRefused(
+        domain: String,
+        entityId: String,
+        deviceClass: String? = null,
+        service: String? = null,
+    ): Boolean {
+        val normalizedDomain = domain.lowercase()
+        if (normalizedDomain in refusedDomains) return true
+        val entityDomain = entityId.substringBefore('.').lowercase()
+        if (entityDomain in refusedDomains) return true
+        if ((normalizedDomain == "cover" || entityDomain == "cover") &&
             (deviceClass == "garage" || deviceClass == "garage_door" ||
                 entityId.contains("garage", ignoreCase = true))
+        ) return true
+        val normalizedService = service?.lowercase().orEmpty()
+        if (normalizedService == "lock" || normalizedService == "unlock" ||
+            normalizedService.startsWith("alarm_")
         ) return true
         return false
     }
@@ -68,8 +86,9 @@ object PolicyController {
         newState: String,
         sourceDevice: String,
         deviceClass: String? = null,
+        service: String? = null,
     ): PendingAction? {
-        if (isRefused(domain, entityId, deviceClass)) {
+        if (isRefused(domain, entityId, deviceClass, service)) {
             audit("refused", "refused", summary)
             return null
         }

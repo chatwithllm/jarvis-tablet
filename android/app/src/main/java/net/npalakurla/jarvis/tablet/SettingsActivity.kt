@@ -7,6 +7,7 @@ import android.view.Gravity
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -14,32 +15,66 @@ import androidx.appcompat.app.AppCompatActivity
 /**
  * First-run ContextForge setup + FR-54 re-auth prompt.
  *
- * Collects the ContextForge MCP gateway URL and the scoped `jarvis-ha`
- * bearer (issue #10, owner direction 2026-11-05) and stores them in
+ * Collects the ContextForge MCP gateway URL and the scoped MCP bearer,
+ * plus the separate `cf-jarvis-tablet-llm` bearer, base URL, and model
+ * for the direct `/llm/v1` voice path. All of it is stored in
  * Keystore-backed EncryptedSharedPreferences via [TokenStore]. The
- * tablet never holds a raw Home Assistant long-lived token — the
- * upstream HA credential lives in the gateway DB. The bearer is never
- * shown in the HUD, never logged, and never leaves the device. Voice
- * stays disabled until valid credentials are saved.
+ * tablet never holds a raw Home Assistant long-lived token. Bearers are
+ * never shown in the HUD, never logged, and never leave the device.
+ *
+ * Voice uses the direct path when the LLM bearer is saved, and the Mini
+ * relay otherwise (and when the direct call fails).
  */
 class SettingsActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val urlInput = EditText(this).apply {
-            hint = "ContextForge URL (MCP endpoint)"
+        val urlInput = field("ContextForge URL (MCP endpoint)").apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             setText(TokenStore.getCfUrl(this@SettingsActivity) ?: TokenStore.DEFAULT_CF_URL)
         }
-        val tokenInput = EditText(this).apply {
-            hint = "ContextForge bearer token (jarvis-ha)"
+        val tokenInput = field("ContextForge MCP bearer (cf-jarvis-tablet)").apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
-        val relayInput = EditText(this).apply {
-            hint = "Voice relay URL (Mini, e.g. http://192.168.20.x:8792) — optional"
+        val relayInput = field("Voice relay URL (Mini) — optional, used as fallback").apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             setText(TokenStore.getVoiceRelayUrl(this@SettingsActivity) ?: "")
+        }
+        val llmUrlInput = field("LLM base URL (ContextForge /llm/v1)").apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setText(TokenStore.getLlmBaseUrl(this@SettingsActivity))
+        }
+        val llmModelInput = field("LLM model (default grok-4.7)").apply {
+            setText(TokenStore.getLlmModel(this@SettingsActivity))
+        }
+        val llmTokenInput = field("LLM bearer (cf-jarvis-tablet-llm) — leave blank to keep").apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val llmState = TextView(this).apply {
+            textSize = 16f
+            setPadding(0, 24, 0, 12)
+        }
+        fun refreshLlmState() {
+            llmState.text = if (TokenStore.hasLlmCredentials(this)) {
+                "LLM token: saved. Voice tries ContextForge directly; the Mini relay is the fallback."
+            } else {
+                "LLM token: not set. Voice uses the Mini relay."
+            }
+        }
+        refreshLlmState()
+        val clearLlm = Button(this).apply {
+            text = "Clear LLM token (use Mini relay)"
+            setOnClickListener {
+                TokenStore.clearLlmToken(this@SettingsActivity)
+                llmTokenInput.setText("")
+                refreshLlmState()
+                Toast.makeText(
+                    this@SettingsActivity,
+                    "LLM token cleared. Voice will use the Mini relay.",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
         }
         val save = Button(this).apply {
             text = "Save and start Jarvis"
@@ -47,20 +82,37 @@ class SettingsActivity : AppCompatActivity() {
                 val url = urlInput.text.toString().trim()
                 val token = tokenInput.text.toString().trim()
                 val relay = relayInput.text.toString().trim()
+                val llmUrl = llmUrlInput.text.toString().trim()
+                val llmModel = llmModelInput.text.toString().trim()
+                val llmToken = llmTokenInput.text.toString().trim()
                 if (!url.startsWith("http://") && !url.startsWith("https://")) {
-                    Toast.makeText(this@SettingsActivity, "URL must start with http:// or https://", Toast.LENGTH_LONG).show()
+                    toast("URL must start with http:// or https://")
                     return@setOnClickListener
                 }
                 if (token.isEmpty()) {
-                    Toast.makeText(this@SettingsActivity, "Paste the jarvis-ha bearer token issued by IT Admin", Toast.LENGTH_LONG).show()
+                    toast("Paste the tablet MCP bearer issued by IT Admin")
                     return@setOnClickListener
                 }
                 if (relay.isNotEmpty() && !relay.startsWith("http://") && !relay.startsWith("https://")) {
-                    Toast.makeText(this@SettingsActivity, "Voice relay URL must start with http:// or https://", Toast.LENGTH_LONG).show()
+                    toast("Voice relay URL must start with http:// or https://")
+                    return@setOnClickListener
+                }
+                if (llmUrl.isNotEmpty() && !llmUrl.startsWith("http://") && !llmUrl.startsWith("https://")) {
+                    toast("LLM URL must start with http:// or https://")
+                    return@setOnClickListener
+                }
+                if (llmModel.any { it.isWhitespace() }) {
+                    toast("LLM model cannot contain spaces")
                     return@setOnClickListener
                 }
                 TokenStore.save(this@SettingsActivity, url, token)
                 if (relay.isNotEmpty()) TokenStore.saveVoiceRelayUrl(this@SettingsActivity, relay)
+                TokenStore.saveLlm(
+                    this@SettingsActivity,
+                    llmUrl.ifEmpty { TokenStore.DEFAULT_LLM_URL },
+                    llmToken,
+                    llmModel.ifEmpty { TokenStore.DEFAULT_LLM_MODEL },
+                )
                 startActivity(
                     Intent(this@SettingsActivity, MainActivity::class.java)
                         .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK),
@@ -69,24 +121,51 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
         val note = TextView(this).apply {
-            text = "The bearer is stored encrypted on this tablet only. " +
-                "It is issued by IT Admin for this tablet (jarvis-ha scope). " +
-                "The Home Assistant credential stays in the gateway — " +
-                "no raw HA token is ever typed here or stored on the tablet. " +
-                "It never goes in the WebView or the repo."
+            text = "Both bearers are stored encrypted on this tablet only. " +
+                "The MCP bearer (cf-jarvis-tablet) is for Home Assistant reads through " +
+                "ContextForge. The LLM bearer (cf-jarvis-tablet-llm) is a different token — " +
+                "the MCP one is rejected on /llm/v1. No raw Home Assistant token is ever " +
+                "typed here or stored on the tablet. Nothing here goes in the WebView or the repo. " +
+                "Leave the LLM bearer blank to keep the saved one. Clear it to force the Mini relay."
             gravity = Gravity.CENTER
+            setPadding(0, 24, 0, 0)
         }
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(96, 96, 96, 96)
-            addView(TextView(context).apply { text = "Jarvis — connect ContextForge"; textSize = 24f; gravity = Gravity.CENTER })
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(96, 48, 96, 48)
+            layoutParams = android.view.ViewGroup.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+            addView(TextView(context).apply {
+                text = "Jarvis — connect ContextForge"
+                textSize = 24f
+                gravity = Gravity.CENTER
+            })
             addView(urlInput)
             addView(tokenInput)
             addView(relayInput)
+            addView(llmUrlInput)
+            addView(llmModelInput)
+            addView(llmTokenInput)
+            addView(llmState)
+            addView(clearLlm)
             addView(save)
             addView(note)
         }
-        setContentView(layout)
+        setContentView(ScrollView(this).apply { addView(layout) })
+    }
+
+    private fun field(hintText: String): EditText = EditText(this).apply {
+        hint = hintText
+        layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = 20 }
+    }
+
+    private fun toast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 }

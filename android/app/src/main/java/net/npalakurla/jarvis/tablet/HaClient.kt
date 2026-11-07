@@ -153,6 +153,66 @@ class HaClient(private val context: Context) {
         return true
     }
 
+    /**
+     * Read-only tools the voice client may call. Writes are not in this
+     * set — a confirmed change goes through [callServiceBlocking] only
+     * after the confirm gate, and only as `ha-call-service`.
+     */
+    private val readTools = setOf(
+        "ha-get-states",
+        "ha-get-state",
+        "ha-get-history",
+        "ha-get-config",
+        "ha-get-logbook",
+    )
+
+    /**
+     * Read-only MCP tool call for the direct voice client. Blocking;
+     * callers already on [Dispatchers.IO]. The name must be one of
+     * [readTools]. The bearer is not included in [arguments] and is not
+     * logged.
+     */
+    internal fun readToolBlocking(name: String, arguments: JSONObject = JSONObject()): Result<String> =
+        runCatching {
+            if (name !in readTools) throw IllegalArgumentException("refusing non-read MCP tool")
+            if (mcpUrl == null || bearer == null) throw IllegalStateException("ContextForge not configured")
+            toolText(callTool(name, arguments))
+                ?: throw IllegalStateException("$name returned no content")
+        }.onFailure { e ->
+            Log.w("HaClient", "readTool $name failed: ${e.message}")
+        }
+
+    /**
+     * One HA service call through the ContextForge MCP tool
+     * `ha-call-service`, after the confirm gate has accepted it.
+     * [PolicyController] is checked again here. There is no raw HA token
+     * on the tablet. The jarvis-ha virtual server is read-only today, so
+     * this fails closed until IT Admin exposes a write tool — a failure
+     * does not fall through to any other credential.
+     */
+    internal fun callServiceBlocking(domain: String, service: String, entityId: String): Result<Unit> =
+        runCatching {
+            if (PolicyController.isRefused(domain, entityId, service = service)) {
+                throw IllegalStateException("refused by policy")
+            }
+            if (!service.matches(Regex("[a-z0-9_]{1,64}"))) {
+                throw IllegalArgumentException("refusing service name")
+            }
+            if (mcpUrl == null || bearer == null) {
+                throw IllegalStateException("ContextForge not configured")
+            }
+            val args = JSONObject().apply {
+                put("domain", domain)
+                put("service", service)
+                put("entity_id", entityId)
+            }
+            callTool("ha-call-service", args)
+                ?: throw IllegalStateException("ha-call-service failed")
+            Unit
+        }.onFailure { e ->
+            Log.w("HaClient", "callService failed: ${e.message}")
+        }
+
     /** Call an MCP tool; returns its `result` object or null on failure. */
     private fun callTool(name: String, arguments: JSONObject = JSONObject()): JSONObject? {
         if (!ensureInitialized()) return null
@@ -290,6 +350,9 @@ object TokenStore {
     private const val KEY_URL = "cf_url"
     private const val KEY_TOKEN = "cf_token"
     private const val KEY_VOICE_RELAY = "voice_relay_url"
+    private const val KEY_LLM_URL = "llm_base_url"
+    private const val KEY_LLM_TOKEN = "llm_token"
+    private const val KEY_LLM_MODEL = "llm_model"
 
     /** Default gateway endpoint (LAN, Wi-Fi) — the tablet is on VLAN 20. */
     const val DEFAULT_CF_URL =
@@ -297,6 +360,15 @@ object TokenStore {
 
     /** Default Mini voice relay (mini/voice-relay.py, LAN only). Set in Settings when deployed. */
     const val DEFAULT_VOICE_RELAY_URL = ""
+
+    /**
+     * ContextForge OpenAI-compatible base (LAN). The chat call is
+     * `{base}/chat/completions`. This bearer is `cf-jarvis-tablet-llm`,
+     * a different secret from the MCP bearer — that one is rejected
+     * with 403 on this route.
+     */
+    const val DEFAULT_LLM_URL = "http://192.168.20.217:4444/llm/v1"
+    const val DEFAULT_LLM_MODEL = "grok-4.7"
 
     private fun prefs(context: Context) =
         EncryptedSharedPreferences.create(
@@ -334,5 +406,41 @@ object TokenStore {
         prefs(context).edit()
             .putString(KEY_VOICE_RELAY, url.trim().trimEnd('/'))
             .apply()
+    }
+
+    /** True when the direct `/llm/v1` bearer is saved. The URL and model have defaults. */
+    fun hasLlmCredentials(context: Context): Boolean = getLlmToken(context) != null
+
+    fun getLlmBaseUrl(context: Context): String =
+        runCatching { prefs(context).getString(KEY_LLM_URL, null) }.getOrNull()
+            ?.trim()?.trimEnd('/')?.ifEmpty { null }
+            ?: DEFAULT_LLM_URL
+
+    fun getLlmModel(context: Context): String =
+        runCatching { prefs(context).getString(KEY_LLM_MODEL, null) }.getOrNull()
+            ?.trim()?.ifEmpty { null }
+            ?: DEFAULT_LLM_MODEL
+
+    /** LLM bearer (`cf-jarvis-tablet-llm`), or null when voice should use the relay. */
+    fun getLlmToken(context: Context): String? =
+        runCatching { prefs(context).getString(KEY_LLM_TOKEN, null) }.getOrNull()
+            ?.trim()?.ifEmpty { null }
+
+    /**
+     * Save the LLM base URL and model. A blank [token] keeps the saved
+     * bearer (the Settings field is not pre-filled). [commit] so a
+     * following read in the restarted activity sees the value.
+     */
+    fun saveLlm(context: Context, baseUrl: String, token: String, model: String) {
+        val edit = prefs(context).edit()
+            .putString(KEY_LLM_URL, baseUrl.trim().trimEnd('/').ifEmpty { DEFAULT_LLM_URL })
+            .putString(KEY_LLM_MODEL, model.trim().ifEmpty { DEFAULT_LLM_MODEL })
+        if (token.isNotBlank()) edit.putString(KEY_LLM_TOKEN, token.trim())
+        edit.commit()
+    }
+
+    /** Drop the LLM bearer. The next voice turn uses the Mini relay. */
+    fun clearLlmToken(context: Context) {
+        prefs(context).edit().remove(KEY_LLM_TOKEN).commit()
     }
 }
