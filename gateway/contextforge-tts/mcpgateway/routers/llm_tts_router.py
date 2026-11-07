@@ -1,0 +1,206 @@
+"""POST /tts mounted beside the ContextForge 1.1.0 LLM proxy.
+
+Review artifact for tag v1.1.0 (aee91ff6db63b6aafa77522684a9483c418bb2a3).
+The household prefix is /llm/v1, so the public path is POST /llm/v1/tts.
+
+Chat completions and GET /models are not defined here. This module does
+not read Caddy config and does not grant permissions.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+
+# Third-Party
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import Response
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+# First-Party
+from mcpgateway.db import LLMProvider, get_db
+from mcpgateway.middleware.rbac import get_current_user_with_permissions, require_permission
+from mcpgateway.services.llm_tts_proxy import (
+    FIXED_PROVIDER_ID,
+    FORBIDDEN_OVERRIDE_KEYS,
+    AccessRequest,
+    SpeechDenied,
+    TtsProxy,
+)
+from mcpgateway.utils.services_auth import decode_auth
+from mcpgateway.utils.verify_credentials import (
+    get_auth_bearer_token_from_request,
+    verify_jwt_token_cached,
+)
+
+llm_tts_router = APIRouter()
+_proxy = TtsProxy()
+# Tablet JSON is a few kilobytes. Stop copying an upload before request.body()
+# would concatenate it. A slow body under this cap is not timed out here.
+MAX_REQUEST_BYTES = 64 * 1024
+# wait_for returns to the awaiter. It does not stop the worker thread.
+AWAITER_TIMEOUT_SECONDS = 35
+
+
+class TtsBody(BaseModel):
+    """Fields the tablet sends. Extra keys are rejected.
+
+    with_timestamps is accepted only so a true value can be refused.
+    xAI would otherwise switch the success body from raw MP3 to JSON.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=4000)
+    language: str
+    voice_id: str
+    speed: float = 1.08
+    output_format: dict | None = None
+    with_timestamps: bool | None = None
+
+
+def _denied(exc: SpeechDenied) -> HTTPException:
+    return HTTPException(status_code=exc.status, detail=exc.detail)
+
+
+async def _ip_restrictions(request: Request) -> tuple:
+    """Read the pin from the JWT scopes claim. Do not log the token."""
+    token = get_auth_bearer_token_from_request(request)
+    if not token:
+        return tuple()
+    try:
+        payload = await verify_jwt_token_cached(token, request)
+    except Exception:
+        return tuple()
+    scopes = payload.get("scopes") if isinstance(payload, dict) else None
+    if not isinstance(scopes, dict):
+        return tuple()
+    raw = scopes.get("ip_restrictions") or []
+    if not isinstance(raw, list):
+        return tuple()
+    return tuple(str(item) for item in raw)
+
+
+def _provider_view(db: Session) -> dict | None:
+    """Load the pinned row and decode its stored key. The key is not logged."""
+    row = db.execute(select(LLMProvider).where(LLMProvider.id == FIXED_PROVIDER_ID)).scalar_one_or_none()
+    if row is None:
+        return None
+    plaintext = ""
+    if row.api_key:
+        try:
+            decoded = decode_auth(row.api_key)
+        except Exception:
+            decoded = {}
+        if isinstance(decoded, dict):
+            value = decoded.get("api_key")
+            if isinstance(value, str):
+                plaintext = value
+    return {
+        "id": row.id,
+        "enabled": bool(row.enabled),
+        "provider_type": row.provider_type,
+        "api_base": row.api_base,
+        "api_key": plaintext,
+    }
+
+
+_BODY_KEYS = frozenset({"text", "language", "voice_id", "speed", "output_format", "with_timestamps"})
+
+
+async def _read_request(request: Request) -> bytes:
+    """Copy the body only up to MAX_REQUEST_BYTES.
+
+    A declared Content-Length over the cap does not iterate the stream.
+    This does not drain bytes the ASGI server already accepted, and it
+    does not bound how long a smaller trickle may take.
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            size = int(declared)
+        except ValueError:
+            raise HTTPException(status_code=413, detail="TTS request is too large") from None
+        if size < 0 or size > MAX_REQUEST_BYTES:
+            raise HTTPException(status_code=413, detail="TTS request is too large")
+    chunks = []
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        if total + len(chunk) > MAX_REQUEST_BYTES:
+            raise HTTPException(status_code=413, detail="TTS request is too large")
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
+def _parse_body(raw: bytes) -> TtsBody:
+    """Validate JSON without echoing the caller's text back in the error."""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid TTS request") from None
+    if not isinstance(data, dict) or not set(data).issubset(_BODY_KEYS):
+        raise HTTPException(status_code=422, detail="Invalid TTS request")
+    try:
+        return TtsBody.model_validate(data)
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="Invalid TTS request") from None
+
+
+# Public route: POST /tts  (full path is {LLM_API_PREFIX}/tts, household /llm/v1/tts).
+@llm_tts_router.post("/tts", summary="Tablet text to speech")
+@require_permission("llm.invoke", allow_admin_bypass=False)
+async def text_to_speech(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user_with_permissions),
+):
+    """Speak one reply. Auth and the token IP pin run before the upstream call.
+
+    The inbound Authorization header is the tablet token. It is required
+    and is not an override. It is not copied upstream.
+
+    Credentials: llm_providers.id 78770f3fb044491fa06bfcc0d4b19825, then
+    decode_auth(row.api_key)["api_key"].
+    """
+    if current_user is None or "email" not in current_user:
+        raise HTTPException(status_code=401, detail="Authorization token required")
+    # Query keys only. Do not treat the Authorization header as an override.
+    override = tuple(key for key in FORBIDDEN_OVERRIDE_KEYS if key in request.query_params)
+    body = _parse_body(await _read_request(request))
+    try:
+        restrictions = await _ip_restrictions(request)
+        access = AccessRequest(
+            has_token=True,
+            permissions=tuple(current_user.get("token_scopes") or ()),
+            socket_ip=request.client.host if request.client else None,
+            x_forwarded_for=request.headers.get("x-forwarded-for"),
+            x_real_ip=request.headers.get("x-real-ip"),
+            ip_restrictions=restrictions,
+            override_keys=override,
+        )
+        if await request.is_disconnected():
+            raise SpeechDenied(499, "Client cancelled")
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                _proxy.speak,
+                access,
+                _provider_view(db),
+                body.text,
+                body.language,
+                body.voice_id,
+                body.speed,
+                body.output_format,
+                body.with_timestamps,
+            ),
+            timeout=AWAITER_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="TTS deadline exceeded") from None
+    except SpeechDenied as exc:
+        raise _denied(exc) from None
+    return Response(content=result.body, media_type=result.content_type, status_code=result.status)

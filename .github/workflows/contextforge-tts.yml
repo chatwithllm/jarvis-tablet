@@ -1,0 +1,21 @@
+# Mock tests for the review-only ContextForge 1.1.0 TTS patch.
+# Does not deploy, restart, or call xAI.
+name: ContextForge TTS patch
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  tts-mocks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test dependencies
+        run: python -m pip install 'fastapi==0.162.0' 'starlette==1.10.0' 'pydantic==2.14.2' 'httpx==0.28.1'
+      - name: Mock TTS tests
+        run: python -m unittest discover -s gateway/contextforge-tts/tests -v

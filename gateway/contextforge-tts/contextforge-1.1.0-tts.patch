@@ -1,0 +1,791 @@
+diff --git a/mcpgateway/main.py b/mcpgateway/main.py
+index a3b5759..038cbe5 100644
+--- a/mcpgateway/main.py
++++ b/mcpgateway/main.py
+@@ -12996,6 +12996,21 @@ if settings.llmchat_enabled:
+     except ImportError as e:
+         logger.debug(f"LLM proxy router not available: {e}")
+ 
++    try:
++        # First-Party
++        from mcpgateway.services.llm_tts_proxy import mount_tts  # pylint: disable=import-outside-toplevel
++
++        mount_tts(app, settings.llm_api_prefix, logger)
++    except Exception as exc:
++        logger.error("LLM TTS router unavailable: %s", type(exc).__name__)
++        _tts_fallback = APIRouter()
++
++        @_tts_fallback.post("/tts")
++        async def _tts_unavailable():
++            raise HTTPException(status_code=503, detail="TTS unavailable")
++
++        app.include_router(_tts_fallback, prefix=settings.llm_api_prefix, tags=["LLM TTS"])
++
+ # Feature flags for admin UI (logged for visibility; admin router is inside v1_router)
+ UI_ENABLED = settings.mcpgateway_ui_enabled
+ ADMIN_API_ENABLED = settings.mcpgateway_admin_api_enabled
+diff --git a/mcpgateway/middleware/token_scoping.py b/mcpgateway/middleware/token_scoping.py
+index 33d7bfd..9bf4cb9 100644
+--- a/mcpgateway/middleware/token_scoping.py
++++ b/mcpgateway/middleware/token_scoping.py
+@@ -385,6 +385,7 @@ def _get_llm_permission_patterns(prefix: str) -> Tuple[Tuple[str, Pattern[str],
+         # unlike many REST resources that intentionally include sub-resources.
+         ("POST", re.compile(rf"^{escaped_prefix}/chat/completions/?$"), Permissions.LLM_INVOKE),
+         ("GET", re.compile(rf"^{escaped_prefix}/models/?$"), Permissions.LLM_READ),
++        ("POST", re.compile(rf"^{escaped_prefix}/tts/?$"), Permissions.LLM_INVOKE),
+     )
+ 
+ 
+diff --git a/mcpgateway/services/llm_tts_proxy.py b/mcpgateway/services/llm_tts_proxy.py
+new file mode 100644
+--- /dev/null
++++ b/mcpgateway/services/llm_tts_proxy.py
+@@ -0,0 +1,537 @@
++"""POST /tts proxy core for ContextForge 1.1.0.
++
++No ContextForge import. The router mounts this on the gateway. Tests
++drive it with a fake opener, so nothing here contacts xAI.
++
++Upstream is fixed to provider id 78770f3fb044491fa06bfcc0d4b19825
++(xai-tablet) and https://api.x.ai/v1/tts. The tablet bearer is never
++placed on the upstream request.
++"""
++
++from __future__ import annotations
++
++import ipaddress
++import json
++import threading
++import time
++import urllib.request
++from dataclasses import dataclass
++from typing import Callable, Mapping, Optional
++from urllib.error import HTTPError, URLError
++from urllib.request import Request
++
++PATCH_VERSION = "1.1.0+tablet-tts.6"
++FIXED_PROVIDER_ID = "78770f3fb044491fa06bfcc0d4b19825"
++REQUIRED_PROVIDER_TYPE = "openai_compatible"
++REQUIRED_API_BASE = "https://api.x.ai/v1"
++UPSTREAM_TTS = "https://api.x.ai/v1/tts"
++TABLET_CIDR = "192.168.20.109/32"
++REQUIRED_PERMISSION = "llm.invoke"
++
++MAX_TTS_CHARS = 4_000
++MAX_RESPONSE_BYTES = 10 * 1024 * 1024
++# One recv, not one byte. 10 MiB is at most 160 of these, not 10 million.
++BODY_READ_BYTES = 64 * 1024
++MAX_IN_FLIGHT = 2
++MAX_PER_MINUTE = 30
++UPSTREAM_TIMEOUT_SECONDS = 30.0
++
++ALLOWED_VOICES = frozenset(
++    {"leo", "altair", "lux", "eve", "rex", "sal", "ara", "rigel"}
++)
++FORBIDDEN_OVERRIDE_KEYS = frozenset(
++    {
++        "provider",
++        "provider_id",
++        "url",
++        "upstream",
++        "base_url",
++        "api_base",
++        "model",
++        "api_key",
++        "authorization",
++        "x-api-key",
++    }
++)
++
++
++class SpeechDenied(Exception):
++    def __init__(self, status: int, detail: str):
++        super().__init__(detail)
++        self.status = status
++        self.detail = detail
++
++
++class SpeechBusy(SpeechDenied):
++    def __init__(self):
++        super().__init__(429, "Too many speech requests")
++
++
++@dataclass(frozen=True)
++class AccessRequest:
++    has_token: bool
++    permissions: tuple
++    socket_ip: Optional[str]
++    x_forwarded_for: Optional[str]
++    x_real_ip: Optional[str]
++    ip_restrictions: tuple
++    override_keys: tuple = ()
++
++
++@dataclass(frozen=True)
++class UpstreamResult:
++    status: int
++    content_type: str
++    body: bytes
++
++
++LogFn = Callable[[str], None]
++
++
++def _noop_log(_message: str) -> None:
++    return None
++
++
++def authorize(access: AccessRequest) -> None:
++    """Reject before any upstream call.
++
++    The socket peer is the only IP that can pass. X-Forwarded-For and
++    X-Real-IP never grant access. Caddy on :4444 is the edge that
++    replaces a client forwarded address with the TCP peer; this check
++    does not edit that edge, and it still refuses a header that names
++    a different address than the peer the gateway process sees.
++    """
++    if access.override_keys:
++        raise SpeechDenied(400, "Client overrides are not accepted")
++    if not access.has_token:
++        raise SpeechDenied(401, "Authorization token required")
++    if not _scope_allows(access.permissions):
++        raise SpeechDenied(403, "Missing llm.invoke")
++    if _forwarded_disagrees(access.socket_ip, access.x_forwarded_for, access.x_real_ip):
++        raise SpeechDenied(403, "Forwarded IP header does not match the connection")
++    if not access.ip_restrictions:
++        raise SpeechDenied(403, "Token is not IP-pinned")
++    # The allow set is the token's existing ip_restrictions. This route
++    # does not add a second hardcoded address. The household token is
++    # already pinned to TABLET_CIDR; that fact is metadata, not a new grant.
++    if not _ip_allowed(access.socket_ip, access.ip_restrictions):
++        raise SpeechDenied(403, "Connection IP is not allowed by the token pin")
++
++
++def _scope_allows(permissions: tuple) -> bool:
++    """Match ContextForge token_scope_grants for a non-empty scope list.
++
++    None is not used here. An explicit list must contain llm.invoke, *,
++    or llm.*. An empty list is not llm.invoke.
++    """
++    perms = {str(item) for item in permissions}
++    if not perms:
++        return False
++    if "*" in perms or "llm.*" in perms or REQUIRED_PERMISSION in perms:
++        return True
++    return False
++
++
++def _forwarded_disagrees(socket_ip: Optional[str], xff: Optional[str], real_ip: Optional[str]) -> bool:
++    for raw in (xff, real_ip):
++        if raw is None:
++            continue
++        text = str(raw).strip()
++        if not text:
++            continue
++        first = text.split(",")[0].strip()
++        if first != (socket_ip or ""):
++            return True
++    return False
++
++
++def _ip_allowed(client_ip: Optional[str], restrictions: tuple) -> bool:
++    if not client_ip or client_ip == "unknown":
++        return False
++    try:
++        client = ipaddress.ip_address(client_ip)
++    except ValueError:
++        return False
++    for restriction in restrictions:
++        try:
++            if "/" in str(restriction):
++                if client in ipaddress.ip_network(str(restriction), strict=False):
++                    return True
++            elif client == ipaddress.ip_address(str(restriction)):
++                return True
++        except ValueError:
++            continue
++    return False
++
++
++def resolve_provider(provider: Optional[Mapping]) -> str:
++    """Return the stored xAI key for the pinned xai-tablet row only.
++
++    The id, provider_type, and api_base must match the Key Keeper
++    metadata. That metadata is not a TTS capability check. The key is
++    the plaintext already produced by decode_auth on the stored
++    ciphertext. Callers must not log it. A client api_base or key is
++    not read here.
++    """
++    if not provider or provider.get("id") != FIXED_PROVIDER_ID:
++        raise SpeechDenied(503, "Speech provider is not configured")
++    if provider.get("enabled") is False:
++        raise SpeechDenied(503, "Speech provider is disabled")
++    if str(provider.get("provider_type") or "") != REQUIRED_PROVIDER_TYPE:
++        raise SpeechDenied(503, "Speech provider type is not openai_compatible")
++    base = str(provider.get("api_base") or "").strip().rstrip("/")
++    if base != REQUIRED_API_BASE:
++        raise SpeechDenied(503, "Speech provider host is not api.x.ai")
++    key = provider.get("api_key") or ""
++    if not isinstance(key, str) or not key.strip():
++        raise SpeechDenied(503, "Speech provider key is missing")
++    return key.strip()
++
++
++def build_tts_payload(
++    text: str,
++    language: str,
++    voice_id: str,
++    speed: float = 1.08,
++    output_format: Optional[Mapping] = None,
++    with_timestamps: Optional[bool] = None,
++) -> dict:
++    """xAI TTS JSON. text and language are required. Timestamps are rejected.
++
++    The default xAI response is raw audio, not a JSON envelope. Setting
++    with_timestamps would change that, and this route does not implement it.
++    """
++    if with_timestamps:
++        raise SpeechDenied(400, "Timestamps are not supported")
++    if not isinstance(text, str) or not text.strip():
++        raise SpeechDenied(400, "TTS text is empty")
++    if len(text) > MAX_TTS_CHARS:
++        raise SpeechDenied(400, "TTS text is too long")
++    if not isinstance(language, str) or language.strip().lower() != "en":
++        raise SpeechDenied(400, "language must be en")
++    voice = (voice_id or "").strip().lower()
++    if "/" in voice or ":" in voice or voice not in ALLOWED_VOICES:
++        raise SpeechDenied(400, "TTS voice is not allowed")
++    try:
++        pace = float(speed)
++    except (TypeError, ValueError):
++        raise SpeechDenied(400, "TTS speed is invalid") from None
++    if pace < 0.7 or pace > 1.5:
++        raise SpeechDenied(400, "TTS speed is out of range")
++    payload = {
++        "text": text,
++        "language": "en",
++        "voice_id": voice,
++        "speed": pace,
++    }
++    if output_format is not None:
++        if not isinstance(output_format, Mapping):
++            raise SpeechDenied(400, "output_format is invalid")
++        codec = str(output_format.get("codec") or "mp3").lower()
++        if codec != "mp3":
++            raise SpeechDenied(400, "codec must be mp3")
++        try:
++            sample_rate = int(output_format.get("sample_rate", 24000))
++            bit_rate = int(output_format.get("bit_rate", 128000))
++        except (TypeError, ValueError):
++            raise SpeechDenied(400, "output_format is invalid") from None
++        if sample_rate not in (8000, 16000, 22050, 24000, 44100, 48000):
++            raise SpeechDenied(400, "sample_rate is not allowed")
++        if bit_rate < 32000 or bit_rate > 320000:
++            raise SpeechDenied(400, "bit_rate is not allowed")
++        payload["output_format"] = {
++            "codec": "mp3",
++            "sample_rate": sample_rate,
++            "bit_rate": bit_rate,
++        }
++    return payload
++
++
++class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
++    """Do not follow upstream redirects. A 3xx must not resend the provider key."""
++
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        raise SpeechDenied(502, "Upstream redirect refused")
++
++
++class _NoEnvProxy(urllib.request.ProxyHandler):
++    """Replace the default ProxyHandler so HTTPS_PROXY is not inherited.
++
++    Subclassing ProxyHandler suppresses urllib's env-based handler.
++    The open methods return None so the normal HTTP handler connects
++    directly. An empty ProxyHandler() would be dropped and the default
++    would come back.
++    """
++
++    def __init__(self):
++        urllib.request.BaseHandler.__init__(self)
++        self.proxies = {}
++
++    def http_open(self, req):
++        return None
++
++    def https_open(self, req):
++        return None
++
++
++def build_safe_opener():
++    """Opener with no environment proxy and no redirect following."""
++    return urllib.request.build_opener(
++        _NoEnvProxy(),
++        _RefuseRedirect(),
++    )
++
++
++def safe_urlopen(request, timeout=UPSTREAM_TIMEOUT_SECONDS):
++    return build_safe_opener().open(request, timeout=timeout)
++
++
++def _close_response(response) -> None:
++    close = getattr(response, "close", None)
++    if close is None:
++        return
++    try:
++        close()
++    except Exception:
++        pass
++
++
++def _pull_bounded(response, size: int):
++    """One slice of at most `size` bytes. Not a deadline.
++
++    ``read1(n)`` is a single underlying recv. A Content-Length
++    HTTPResponse has no ``read1`` of its own; ``fp.read1`` is that recv,
++    clipped to the unread length. A chunked HTTPResponse is left on
++    ``read(n)``, which can block for the rest of a chunk frame or the
++    trailers. No private socket is looked up. A missing ``read1`` does
++    not add a timeout.
++    """
++    read1 = getattr(response, "read1", None)
++    if read1 is not None:
++        return read1(size), False
++    chunked = getattr(response, "chunked", None)
++    fp = getattr(response, "fp", None)
++    fp_read1 = getattr(fp, "read1", None) if fp is not None else None
++    if fp_read1 is not None and chunked is False:
++        length = getattr(response, "length", None)
++        if isinstance(length, int):
++            if length <= 0:
++                return b"", False
++            size = min(size, length)
++        block = fp_read1(size) if size else b""
++        if isinstance(block, bytes) and len(block) > size:
++            block = block[:size]
++        if isinstance(length, int) and isinstance(block, (bytes, bytearray)):
++            response.length = length - len(block)
++        return block, False
++    read = getattr(response, "read", None)
++    if read is None:
++        return None, True
++    try:
++        return read(size), False
++    except TypeError:
++        return read(), True
++
++
++def _read_bounded(response, limit: int, cancel: Optional[threading.Event], deadline: float) -> bytes:
++    """Copy the body in bounded slices, then close it.
++
++    The clock is checked only between slices. One ``read`` or ``read1``
++    can run past ``deadline``. A timeout raised by that call is an
++    upstream failure (502), not a 504. The size cap is enforced on the
++    bytes kept.
++    """
++    chunks = []
++    total = 0
++    try:
++        while True:
++            if cancel is not None and cancel.is_set():
++                raise SpeechDenied(499, "Client cancelled")
++            if time.monotonic() >= deadline:
++                raise SpeechDenied(504, "TTS deadline exceeded")
++            try:
++                block, whole = _pull_bounded(response, BODY_READ_BYTES)
++            except TimeoutError:
++                raise SpeechDenied(502, "Upstream speech request failed") from None
++            if not block:
++                break
++            if total + len(block) > limit:
++                raise SpeechDenied(502, "Upstream speech response is too large")
++            chunks.append(block)
++            total += len(block)
++            if whole:
++                break
++        return b"".join(chunks)
++    finally:
++        _close_response(response)
++
++
++class TtsProxy:
++    def __init__(
++        self,
++        max_in_flight: int = MAX_IN_FLIGHT,
++        max_per_minute: int = MAX_PER_MINUTE,
++        timeout: float = UPSTREAM_TIMEOUT_SECONDS,
++        log: LogFn = _noop_log,
++        clock: Callable[[], float] = time.monotonic,
++        opener: Optional[Callable] = None,
++    ):
++        self._slots = max_in_flight
++        self._max_per_minute = max_per_minute
++        self._timeout = timeout
++        self._log = log
++        self._clock = clock
++        self._opener = opener
++        self._recent: list = []
++        self._lock = threading.Lock()
++
++    def speak(
++        self,
++        access: AccessRequest,
++        provider: Optional[Mapping],
++        text: str,
++        language: str,
++        voice_id: str,
++        speed: float = 1.08,
++        output_format: Optional[Mapping] = None,
++        with_timestamps: Optional[bool] = None,
++        opener: Optional[Callable] = None,
++        cancel: Optional[threading.Event] = None,
++    ) -> UpstreamResult:
++        authorize(access)
++        if cancel is not None and cancel.is_set():
++            raise SpeechDenied(499, "Client cancelled")
++        key = resolve_provider(provider)
++        payload = build_tts_payload(
++            text,
++            language,
++            voice_id,
++            speed,
++            output_format,
++            with_timestamps,
++        )
++        body = json.dumps(payload).encode("utf-8")
++        self._charge_rate()
++        return self._send(key, body, opener or self._opener or safe_urlopen, cancel)
++
++    def _charge_rate(self) -> None:
++        now = self._clock()
++        with self._lock:
++            self._recent = [stamp for stamp in self._recent if now - stamp < 60.0]
++            if len(self._recent) >= self._max_per_minute:
++                raise SpeechDenied(429, "TTS rate limit")
++            self._recent.append(now)
++
++    def _send(
++        self,
++        api_key: str,
++        body: bytes,
++        opener: Callable,
++        cancel: Optional[threading.Event],
++    ) -> UpstreamResult:
++        # The clock below is checked between the opener call and between
++        # body slices. It does not cover DNS, a trickled header, or a read
++        # that has not returned. The timeout passed to the opener is that
++        # call's socket timeout, not a deadline around it. The slot is
++        # released in this finally, after the worker returns, including
++        # when the awaiting task was cancelled.
++        deadline = time.monotonic() + self._timeout
++        if cancel is not None and cancel.is_set():
++            raise SpeechDenied(499, "Client cancelled")
++        self._acquire()
++        response = None
++        try:
++            if cancel is not None and cancel.is_set():
++                raise SpeechDenied(499, "Client cancelled")
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise SpeechDenied(504, "TTS deadline exceeded")
++            headers = {
++                "Authorization": "Bearer " + api_key,
++                "Content-Type": "application/json; charset=utf-8",
++                "Accept": "audio/mpeg, application/octet-stream",
++            }
++            request = Request(UPSTREAM_TTS, data=body, headers=headers, method="POST")
++
++            def _open(req, timeout):
++                if cancel is not None and cancel.is_set():
++                    raise SpeechDenied(499, "Client cancelled")
++                return opener(req, timeout=timeout)
++
++            try:
++                response = _open(request, remaining)
++            except SpeechDenied:
++                raise
++            except HTTPError as exc:
++                _close_response(getattr(exc, "fp", None))
++                self._log("tts upstream HTTP %s bytes=0" % exc.code)
++                raise SpeechDenied(502, "Upstream speech request failed") from None
++            except URLError:
++                self._log("tts upstream HTTP 0 bytes=0")
++                raise SpeechDenied(502, "Upstream speech request failed") from None
++            except Exception:
++                self._log("tts upstream HTTP 0 bytes=0")
++                raise SpeechDenied(502, "Upstream speech request failed") from None
++            if (cancel is not None and cancel.is_set()) or time.monotonic() >= deadline:
++                _close_response(response)
++                response = None
++                if cancel is not None and cancel.is_set():
++                    raise SpeechDenied(499, "Client cancelled")
++                raise SpeechDenied(504, "TTS deadline exceeded")
++            status = getattr(response, "status", None) or getattr(response, "code", 200)
++            raw_type = ""
++            if getattr(response, "headers", None) is not None:
++                raw_type = response.headers.get("Content-Type") or response.headers.get("content-type") or ""
++            payload = _read_bounded(response, MAX_RESPONSE_BYTES, cancel, deadline)
++            response = None
++            self._log("tts upstream HTTP %s bytes=%s" % (status, len(payload)))
++            if status < 200 or status >= 300:
++                raise SpeechDenied(502, "Upstream speech request failed")
++            if not raw_type:
++                raw_type = "audio/mpeg"
++            media = raw_type.split(";")[0].strip().lower()
++            if media != "audio/mpeg":
++                raise SpeechDenied(502, "Upstream speech response was not audio/mpeg")
++            return UpstreamResult(status=int(status), content_type=raw_type, body=payload)
++        finally:
++            if response is not None:
++                _close_response(response)
++            self._release()
++
++    def _acquire(self) -> None:
++        with self._lock:
++            if self._slots <= 0:
++                raise SpeechBusy()
++            self._slots -= 1
++
++    def _release(self) -> None:
++        with self._lock:
++            self._slots += 1
++
++
++def mount_tts(app, prefix: str, logger) -> str:
++    """Mount POST /tts, or a 503 fallback. Never raises.
++
++    A failure to import the real router must not affect routes already
++    mounted on ``app`` (chat and models). The error log is the exception
++    type name only.
++    """
++    try:
++        from mcpgateway.routers.llm_tts_router import llm_tts_router
++
++        app.include_router(llm_tts_router, prefix=prefix, tags=["LLM TTS"])
++        logger.info("LLM TTS router included at prefix %s", prefix)
++        return "mounted"
++    except Exception as exc:
++        logger.error("LLM TTS router unavailable: %s", type(exc).__name__)
++        from fastapi import APIRouter
++        from fastapi import HTTPException
++
++        fallback = APIRouter()
++
++        @fallback.post("/tts")
++        async def _tts_unavailable():
++            raise HTTPException(status_code=503, detail="TTS unavailable")
++
++        app.include_router(fallback, prefix=prefix, tags=["LLM TTS"])
++        return "unavailable"
+diff --git a/mcpgateway/routers/llm_tts_router.py b/mcpgateway/routers/llm_tts_router.py
+new file mode 100644
+--- /dev/null
++++ b/mcpgateway/routers/llm_tts_router.py
+@@ -0,0 +1,206 @@
++"""POST /tts mounted beside the ContextForge 1.1.0 LLM proxy.
++
++Review artifact for tag v1.1.0 (aee91ff6db63b6aafa77522684a9483c418bb2a3).
++The household prefix is /llm/v1, so the public path is POST /llm/v1/tts.
++
++Chat completions and GET /models are not defined here. This module does
++not read Caddy config and does not grant permissions.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++
++# Third-Party
++from fastapi import APIRouter, Depends, HTTPException, Request
++from fastapi.responses import Response
++from pydantic import BaseModel, ConfigDict, Field, ValidationError
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++# First-Party
++from mcpgateway.db import LLMProvider, get_db
++from mcpgateway.middleware.rbac import get_current_user_with_permissions, require_permission
++from mcpgateway.services.llm_tts_proxy import (
++    FIXED_PROVIDER_ID,
++    FORBIDDEN_OVERRIDE_KEYS,
++    AccessRequest,
++    SpeechDenied,
++    TtsProxy,
++)
++from mcpgateway.utils.services_auth import decode_auth
++from mcpgateway.utils.verify_credentials import (
++    get_auth_bearer_token_from_request,
++    verify_jwt_token_cached,
++)
++
++llm_tts_router = APIRouter()
++_proxy = TtsProxy()
++# Tablet JSON is a few kilobytes. Stop copying an upload before request.body()
++# would concatenate it. A slow body under this cap is not timed out here.
++MAX_REQUEST_BYTES = 64 * 1024
++# wait_for returns to the awaiter. It does not stop the worker thread.
++AWAITER_TIMEOUT_SECONDS = 35
++
++
++class TtsBody(BaseModel):
++    """Fields the tablet sends. Extra keys are rejected.
++
++    with_timestamps is accepted only so a true value can be refused.
++    xAI would otherwise switch the success body from raw MP3 to JSON.
++    """
++
++    model_config = ConfigDict(extra="forbid")
++
++    text: str = Field(min_length=1, max_length=4000)
++    language: str
++    voice_id: str
++    speed: float = 1.08
++    output_format: dict | None = None
++    with_timestamps: bool | None = None
++
++
++def _denied(exc: SpeechDenied) -> HTTPException:
++    return HTTPException(status_code=exc.status, detail=exc.detail)
++
++
++async def _ip_restrictions(request: Request) -> tuple:
++    """Read the pin from the JWT scopes claim. Do not log the token."""
++    token = get_auth_bearer_token_from_request(request)
++    if not token:
++        return tuple()
++    try:
++        payload = await verify_jwt_token_cached(token, request)
++    except Exception:
++        return tuple()
++    scopes = payload.get("scopes") if isinstance(payload, dict) else None
++    if not isinstance(scopes, dict):
++        return tuple()
++    raw = scopes.get("ip_restrictions") or []
++    if not isinstance(raw, list):
++        return tuple()
++    return tuple(str(item) for item in raw)
++
++
++def _provider_view(db: Session) -> dict | None:
++    """Load the pinned row and decode its stored key. The key is not logged."""
++    row = db.execute(select(LLMProvider).where(LLMProvider.id == FIXED_PROVIDER_ID)).scalar_one_or_none()
++    if row is None:
++        return None
++    plaintext = ""
++    if row.api_key:
++        try:
++            decoded = decode_auth(row.api_key)
++        except Exception:
++            decoded = {}
++        if isinstance(decoded, dict):
++            value = decoded.get("api_key")
++            if isinstance(value, str):
++                plaintext = value
++    return {
++        "id": row.id,
++        "enabled": bool(row.enabled),
++        "provider_type": row.provider_type,
++        "api_base": row.api_base,
++        "api_key": plaintext,
++    }
++
++
++_BODY_KEYS = frozenset({"text", "language", "voice_id", "speed", "output_format", "with_timestamps"})
++
++
++async def _read_request(request: Request) -> bytes:
++    """Copy the body only up to MAX_REQUEST_BYTES.
++
++    A declared Content-Length over the cap does not iterate the stream.
++    This does not drain bytes the ASGI server already accepted, and it
++    does not bound how long a smaller trickle may take.
++    """
++    declared = request.headers.get("content-length")
++    if declared is not None:
++        try:
++            size = int(declared)
++        except ValueError:
++            raise HTTPException(status_code=413, detail="TTS request is too large") from None
++        if size < 0 or size > MAX_REQUEST_BYTES:
++            raise HTTPException(status_code=413, detail="TTS request is too large")
++    chunks = []
++    total = 0
++    async for chunk in request.stream():
++        if not chunk:
++            continue
++        if total + len(chunk) > MAX_REQUEST_BYTES:
++            raise HTTPException(status_code=413, detail="TTS request is too large")
++        chunks.append(chunk)
++        total += len(chunk)
++    return b"".join(chunks)
++
++
++def _parse_body(raw: bytes) -> TtsBody:
++    """Validate JSON without echoing the caller's text back in the error."""
++    try:
++        data = json.loads(raw)
++    except Exception:
++        raise HTTPException(status_code=422, detail="Invalid TTS request") from None
++    if not isinstance(data, dict) or not set(data).issubset(_BODY_KEYS):
++        raise HTTPException(status_code=422, detail="Invalid TTS request")
++    try:
++        return TtsBody.model_validate(data)
++    except ValidationError:
++        raise HTTPException(status_code=422, detail="Invalid TTS request") from None
++
++
++# Public route: POST /tts  (full path is {LLM_API_PREFIX}/tts, household /llm/v1/tts).
++@llm_tts_router.post("/tts", summary="Tablet text to speech")
++@require_permission("llm.invoke", allow_admin_bypass=False)
++async def text_to_speech(
++    request: Request,
++    db: Session = Depends(get_db),
++    current_user: dict = Depends(get_current_user_with_permissions),
++):
++    """Speak one reply. Auth and the token IP pin run before the upstream call.
++
++    The inbound Authorization header is the tablet token. It is required
++    and is not an override. It is not copied upstream.
++
++    Credentials: llm_providers.id 78770f3fb044491fa06bfcc0d4b19825, then
++    decode_auth(row.api_key)["api_key"].
++    """
++    if current_user is None or "email" not in current_user:
++        raise HTTPException(status_code=401, detail="Authorization token required")
++    # Query keys only. Do not treat the Authorization header as an override.
++    override = tuple(key for key in FORBIDDEN_OVERRIDE_KEYS if key in request.query_params)
++    body = _parse_body(await _read_request(request))
++    try:
++        restrictions = await _ip_restrictions(request)
++        access = AccessRequest(
++            has_token=True,
++            permissions=tuple(current_user.get("token_scopes") or ()),
++            socket_ip=request.client.host if request.client else None,
++            x_forwarded_for=request.headers.get("x-forwarded-for"),
++            x_real_ip=request.headers.get("x-real-ip"),
++            ip_restrictions=restrictions,
++            override_keys=override,
++        )
++        if await request.is_disconnected():
++            raise SpeechDenied(499, "Client cancelled")
++        result = await asyncio.wait_for(
++            asyncio.to_thread(
++                _proxy.speak,
++                access,
++                _provider_view(db),
++                body.text,
++                body.language,
++                body.voice_id,
++                body.speed,
++                body.output_format,
++                body.with_timestamps,
++            ),
++            timeout=AWAITER_TIMEOUT_SECONDS,
++        )
++    except asyncio.TimeoutError:
++        raise HTTPException(status_code=504, detail="TTS deadline exceeded") from None
++    except SpeechDenied as exc:
++        raise _denied(exc) from None
++    return Response(content=result.body, media_type=result.content_type, status_code=result.status)

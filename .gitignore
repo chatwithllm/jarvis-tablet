@@ -55,3 +55,6 @@ Thumbs.db
 # Node (if the web HUD is built with tooling)
 node_modules/
 dist/
+
+__pycache__/
+*.pyc
