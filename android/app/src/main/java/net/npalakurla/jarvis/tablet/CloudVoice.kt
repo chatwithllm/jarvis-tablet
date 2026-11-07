@@ -10,8 +10,8 @@ import java.net.URL
 /**
  * Cloud STT and TTS through the ContextForge `/llm/v1` base.
  *
- * xAI's routes are `POST /v1/stt` and `POST /v1/tts`, not the OpenAI
- * `/audio/*` paths. This client calls `{llmBase}/stt` and `{llmBase}/tts`
+ * xAI's routes are POST /v1/stt and POST /v1/tts, not the OpenAI
+ * audio transcription and speech paths. This client calls {llmBase}/stt and {llmBase}/tts
  * with the saved LLM bearer. The gateway does not proxy those routes
  * today, so a 404 (or any transport failure) returns [Stt.Unavailable]
  * / null and the caller falls back to Vosk or Android TTS.
