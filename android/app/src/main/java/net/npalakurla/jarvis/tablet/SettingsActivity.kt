@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -34,12 +35,15 @@ class SettingsActivity : AppCompatActivity() {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             setText(TokenStore.getCfUrl(this@SettingsActivity) ?: TokenStore.DEFAULT_CF_URL)
         }
-        val tokenInput = field("ContextForge MCP bearer (cf-jarvis-tablet)").apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        val tokenSaved = TokenStore.getCfToken(this) != null
+        val tokenInput = field(
+            if (tokenSaved) "ContextForge MCP bearer — saved" else "ContextForge MCP bearer (cf-jarvis-tablet)",
+        ).apply {
+            if (tokenSaved) setText(TokenStore.SAVED_TOKEN_MASK)
         }
         val relayInput = field("Voice relay URL (Mini) — optional, used as fallback").apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            setText(TokenStore.getVoiceRelayUrl(this@SettingsActivity) ?: "")
+            setText(TokenStore.getVoiceRelayUrl(this@SettingsActivity))
         }
         val llmUrlInput = field("LLM base URL (ContextForge /llm/v1)").apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
@@ -48,8 +52,11 @@ class SettingsActivity : AppCompatActivity() {
         val llmModelInput = field("LLM model (default grok-4.7)").apply {
             setText(TokenStore.getLlmModel(this@SettingsActivity))
         }
-        val llmTokenInput = field("LLM bearer (cf-jarvis-tablet-llm) — leave blank to keep").apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        val llmSaved = TokenStore.hasLlmCredentials(this)
+        val llmTokenInput = field(
+            if (llmSaved) "LLM bearer — saved" else "LLM bearer (cf-jarvis-tablet-llm)",
+        ).apply {
+            if (llmSaved) setText(TokenStore.SAVED_TOKEN_MASK)
         }
         val llmState = TextView(this).apply {
             textSize = 16f
@@ -63,6 +70,19 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
         refreshLlmState()
+        val catalog = WakePhrases.load(this)
+        val wakeNow = WakeConfig.current(this, catalog)
+        val phraseBoxes = catalog.choices.map { phrase ->
+            CheckBox(this).apply {
+                text = phrase
+                isChecked = phrase in wakeNow.enabled
+                textSize = 18f
+            }
+        }
+        val confInput = field("Wake confidence 0.50–0.99 (default 0.85)").apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText(String.format(java.util.Locale.US, "%.2f", wakeNow.threshold))
+        }
         val clearLlm = Button(this).apply {
             text = "Clear LLM token (use Mini relay)"
             setOnClickListener {
@@ -89,7 +109,8 @@ class SettingsActivity : AppCompatActivity() {
                     toast("URL must start with http:// or https://")
                     return@setOnClickListener
                 }
-                if (token.isEmpty()) {
+                val keepMcp = token.isEmpty() || token.equals(TokenStore.SAVED_TOKEN_MASK, ignoreCase = true)
+                if (keepMcp && TokenStore.getCfToken(this@SettingsActivity) == null) {
                     toast("Paste the tablet MCP bearer issued by IT Admin")
                     return@setOnClickListener
                 }
@@ -105,6 +126,16 @@ class SettingsActivity : AppCompatActivity() {
                     toast("LLM model cannot contain spaces")
                     return@setOnClickListener
                 }
+                val enabledPhrases = phraseBoxes.filter { it.isChecked }.map { it.text.toString() }.toSet()
+                if (enabledPhrases.isEmpty()) {
+                    toast("Leave at least one wake phrase on. Hey Jarvis is not available on this tablet.")
+                    return@setOnClickListener
+                }
+                val wakeConf = confInput.text.toString().toFloatOrNull()
+                if (wakeConf == null || wakeConf < 0.50f || wakeConf > 0.99f) {
+                    toast("Wake confidence must be between 0.50 and 0.99")
+                    return@setOnClickListener
+                }
                 TokenStore.save(this@SettingsActivity, url, token)
                 if (relay.isNotEmpty()) TokenStore.saveVoiceRelayUrl(this@SettingsActivity, relay)
                 TokenStore.saveLlm(
@@ -113,6 +144,7 @@ class SettingsActivity : AppCompatActivity() {
                     llmToken,
                     llmModel.ifEmpty { TokenStore.DEFAULT_LLM_MODEL },
                 )
+                WakeConfig.save(this@SettingsActivity, enabledPhrases, wakeConf)
                 startActivity(
                     Intent(this@SettingsActivity, MainActivity::class.java)
                         .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK),
@@ -126,7 +158,8 @@ class SettingsActivity : AppCompatActivity() {
                 "ContextForge. The LLM bearer (cf-jarvis-tablet-llm) is a different token — " +
                 "the MCP one is rejected on /llm/v1. No raw Home Assistant token is ever " +
                 "typed here or stored on the tablet. Nothing here goes in the WebView or the repo. " +
-                "Leave the LLM bearer blank to keep the saved one. Clear it to force the Mini relay."
+                "A field that says saved already has a token — leave it to keep that token. " +
+                "Clear the LLM bearer to force the Mini relay."
             gravity = Gravity.CENTER
             setPadding(0, 24, 0, 0)
         }
@@ -151,6 +184,13 @@ class SettingsActivity : AppCompatActivity() {
             addView(llmTokenInput)
             addView(llmState)
             addView(clearLlm)
+            addView(TextView(context).apply {
+                text = "Wake phrases (hey jarvis is never armed)"
+                textSize = 18f
+                setPadding(0, 28, 0, 0)
+            })
+            phraseBoxes.forEach { addView(it) }
+            addView(confInput)
             addView(save)
             addView(note)
         }

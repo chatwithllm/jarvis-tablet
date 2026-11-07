@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.PowerManager
+import android.util.Log
 import android.provider.Settings
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebView
@@ -70,6 +71,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
         )
         // A wake word starts a turn (the HUD event goes out too).
         bridge.onWakeDetected = { voiceTurn.start() }
+        VoiceDebug.handler = { path -> voiceTurn.startFromWav(path) }
         maybeRequestBatteryExemption()
         maybeRequestMicPermission()
         startWakeServiceIfConfigured()
@@ -126,6 +128,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
 
     override fun onDestroy() {
         heartbeatJob?.cancel()
+        VoiceDebug.handler = null
         if (::voiceTurn.isInitialized) voiceTurn.close()
         super.onDestroy()
     }
@@ -235,7 +238,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
             while (isActive) {
                 HaClient(this@MainActivity).postHeartbeat(
                     wakeState = if (WakeService.isRunning) "running" else "stopped",
-                    modelState = WakeModel.state,
+                    modelState = VoskWakeEngine.state,
                 )
                 delay(60_000)
             }
@@ -249,7 +252,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
             put("ha", TokenStore.hasCredentials(this@MainActivity))
             put("wake", WakeService.isRunning && wakeEnabled)
             put("quiet", isQuietHours())
-            put("mic", WakeModel.state)
+            put("mic", VoskWakeEngine.state)
         }
         bridge.sendEvent("status", payload)
     }
@@ -263,10 +266,29 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
     // -- JarvisBridge.Host (WebView -> native) ---------------------------
 
     override fun onTalkPressed() {
-        // Phase 2: start the turn-based pipeline (record -> relay ->
-        // STT/agent/TTS -> speak). The wake word also starts a turn
-        // via WakeService -> bridge wake_detected.
+        bridge.sendEvent("thinking", JSONObject().put("step", "listening"))
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.i("JarvisVoice", "result=mic_permission")
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                REQUEST_MIC_PERMISSION,
+            )
+            bridge.sendEvent(
+                "error",
+                JSONObject()
+                    .put("code", "mic_permission")
+                    .put("message", "Microphone permission missing — voice is off."),
+            )
+            return
+        }
         voiceTurn.start()
+    }
+
+    override fun onOpenSettings() {
+        startActivity(Intent(this, SettingsActivity::class.java))
     }
 
     override fun onCancel(id: String?) {

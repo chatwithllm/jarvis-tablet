@@ -7,6 +7,7 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -22,13 +23,13 @@ import kotlin.math.sqrt
  *
  * Foreground service, pinned non-dismissible notification, START_STICKY.
  * Reads 16 kHz mic audio in 80 ms frames, meters the level (~12.5 Hz,
- * close to the bridge's ~15 Hz), and — once the trained hey_jack.onnx
- * lands in Phase 2 — scores each frame for the wake word.
+ * close to the bridge's ~15 Hz), and runs the Vosk grammar wake
+ * engine ([VoskWakeEngine]). The synthetic hey_jack.onnx scorer is
+ * not used: it never fired on real speech.
  *
- * Until the model exists the service still runs (levels + heartbeat);
- * the turn fails gracefully when HA is down (FR-32) and no cloud
- * session opens while ambient. Mute-after-wake tail is configurable,
- * 0 ms default (FR-29) so chained commands are not clipped.
+ * Mute-after-wake tail is configurable, 0 ms default (FR-29) so
+ * chained commands are not clipped. A debug build registers
+ * [DebugWakeReceiver] so an adb WAV can take the same path.
  */
 class WakeService : Service() {
 
@@ -37,6 +38,7 @@ class WakeService : Service() {
     @Volatile private var running = false
     private val micLock = Any()
     @Volatile private var micYielded = false
+    private var debugReceiver: DebugWakeReceiver? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -45,13 +47,26 @@ class WakeService : Service() {
             NOTIFICATION_ID,
             NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("Jarvis listening")
-                .setContentText("Hey Jack is on — tap the orb or say Hey Jack")
+                .setContentText("Wake listening — hey jack, hey tablet, or okay computer")
                 .setSmallIcon(R.drawable.ic_launcher)
                 .setOngoing(true)
                 .build(),
         )
         isRunning = true
         instance = this
+        if (BuildConfig.DEBUG) {
+            val receiver = DebugWakeReceiver()
+            debugReceiver = receiver
+            ContextCompat.registerReceiver(
+                this,
+                receiver,
+                IntentFilter().apply {
+                    addAction(DebugWakeReceiver.ACTION)
+                    addAction(VoiceDebug.ACTION)
+                },
+                ContextCompat.RECEIVER_EXPORTED,
+            )
+        }
         startMicLoop()
     }
 
@@ -68,13 +83,16 @@ class WakeService : Service() {
             val rec = recorder
             // stop() unblocks AudioRecord.read so the worker can exit.
             runCatching { rec?.stop() }
-            worker?.join(500)
+            worker?.join(5_000)
             runCatching { rec?.release() }
             recorder = null
             worker = null
             isRunning = false
             if (instance === this) instance = null
         }
+        debugReceiver?.let { runCatching { unregisterReceiver(it) } }
+        debugReceiver = null
+        VoskWakeEngine.close()
         super.onDestroy()
     }
 
@@ -138,7 +156,6 @@ class WakeService : Service() {
             )
             return
         }
-        WakeModel.load(this)
         val bufferSize = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
@@ -153,6 +170,8 @@ class WakeService : Service() {
         ).also { it.startRecording() }
         running = true
         worker = Thread({
+            val app = this@WakeService
+            VoskWakeEngine.ensureReady(app)
             val frame = ShortArray(FRAME_SAMPLES)
             var mutedUntilMs = 0L
             while (running) {
@@ -165,13 +184,16 @@ class WakeService : Service() {
                 )
                 val now = System.currentTimeMillis()
                 if (now < mutedUntilMs) continue
-                if (WakeModel.state == "ready" && WakeModel.score(frame) >= threshold) {
-                    mutedUntilMs = now + muteTailMs
-                    listener?.sendEvent(
-                        "wake_detected",
-                        JSONObject().put("source", "wake"),
-                    )
-                }
+                val hit = VoskWakeEngine.onMicrophoneFrame(app, frame, read) ?: continue
+                mutedUntilMs = now + muteTailMs
+                WakeLog.detected(hit.phrase, hit.conf)
+                listener?.sendEvent(
+                    "wake_detected",
+                    JSONObject()
+                        .put("source", "wake")
+                        .put("phrase", hit.phrase)
+                        .put("score", hit.conf.toDouble()),
+                )
             }
         }, "jarvis-wake").also { it.start() }
     }
@@ -191,9 +213,8 @@ class WakeService : Service() {
         const val SAMPLE_RATE = 16_000
         const val FRAME_SAMPLES = 1_280 // 80 ms @ 16 kHz (PRD voice stack)
 
-        /** Runtime tunables (Phase 2 tuning week): threshold + mute tail. */
-        @Volatile var threshold: Float = 0.7f
-        @Volatile var muteTailMs: Long = 0L // FR-29: 0 ms default
+        /** Mute wake scoring for this long after a detection (FR-29, default 0). */
+        @Volatile var muteTailMs: Long = 0L
 
         @Volatile var isRunning: Boolean = false
             private set
@@ -202,6 +223,11 @@ class WakeService : Service() {
         @Volatile var listener: JarvisBridge? = null
 
         @Volatile private var instance: WakeService? = null
+
+        /** Feed a WAV through the wake engine and log JarvisWake. */
+        fun debugWav(context: Context, path: String?) {
+            DebugWake.run(context, path)
+        }
 
         /** Let a voice turn use the mic. No-op when the service is not running. */
         fun pauseMic() {
