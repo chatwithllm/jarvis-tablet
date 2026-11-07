@@ -190,6 +190,13 @@ class ContextForgeLlmTransport(private val context: Context) {
             }
             count++
         }
+        val entity = forwarded.optString("entity_id")
+        if (SafetyGate.refuses(forwarded.toString()) ||
+            SafetyGate.refusesTool(entity.substringBefore('.'), entity, null, entity)
+        ) {
+            Log.i("JarvisVoice", "refused=safety")
+            return "Refused. Locks, garage doors, and the alarm cannot be controlled by voice."
+        }
         val result = ha.readToolBlocking(mcpName, forwarded)
         if (result.isFailure) {
             return if (result.exceptionOrNull() is HaClient.Unauthorized) {
@@ -217,8 +224,21 @@ class ContextForgeLlmTransport(private val context: Context) {
         if (!entityId.matches(ENTITY_ID)) {
             return "entity_id must look like domain.object (lowercase)."
         }
+        val hinted = args.optString("service").trim().ifEmpty { newState }
+        if (SafetyGate.refusesTool(domain, entityId, hinted, "$summary $newState") ||
+            SafetyGate.refuses(newState)
+        ) {
+            Log.i("JarvisVoice", "refused=safety")
+            return "Refused. Locks, garage doors, and the alarm cannot be controlled by voice. " +
+                "Tell the user it is not allowed. Do not suggest a workaround."
+        }
         val service = serviceFor(domain, newState, args.optString("service"))
             ?: return "That service name is not allowed."
+        if (SafetyGate.refusesTool(domain, entityId, service, summary) || SafetyGate.refuses(summary)) {
+            Log.i("JarvisVoice", "refused=safety")
+            return "Refused. Locks, garage doors, and the alarm cannot be controlled by voice. " +
+                "Tell the user it is not allowed. Do not suggest a workaround."
+        }
         val action = VoiceTurn.ProposedAction(
             id = UUID.randomUUID().toString(),
             summary = summary,

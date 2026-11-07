@@ -71,7 +71,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
         )
         // A wake word starts a turn (the HUD event goes out too).
         bridge.onWakeDetected = { voiceTurn.start() }
-        VoiceDebug.handler = { path -> voiceTurn.startFromWav(path) }
+        VoiceDebug.handler = { path, direct -> voiceTurn.startFromWav(path, direct) }
         maybeRequestBatteryExemption()
         maybeRequestMicPermission()
         startWakeServiceIfConfigured()
@@ -208,7 +208,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
                 "error",
                 JSONObject()
                     .put("code", "mic_permission")
-                    .put("message", "Microphone permission denied — voice is off. Grant it in Settings to enable Hey Jack and tap-to-talk."),
+                    .put("message", "Microphone permission denied — voice is off. Grant it in Settings to enable okay computer and tap-to-talk."),
             )
         }
     }

@@ -26,7 +26,10 @@ class DebugWakeReceiver : BroadcastReceiver() {
             try {
                 when (action) {
                     ACTION -> WakeService.debugWav(context.applicationContext, path)
-                    VoiceDebug.ACTION -> VoiceDebug.dispatch(path)
+                    VoiceDebug.ACTION -> VoiceDebug.dispatch(
+                        path,
+                        intent.getBooleanExtra("direct", false),
+                    )
                 }
             } finally {
                 pending.finish()
@@ -43,14 +46,14 @@ class DebugWakeReceiver : BroadcastReceiver() {
 object VoiceDebug {
     const val ACTION = "net.npalakurla.jarvis.tablet.DEBUG_TURN_WAV"
 
-    @Volatile var handler: ((String?) -> Unit)? = null
+    @Volatile var handler: ((String?, Boolean) -> Unit)? = null
 
-    fun dispatch(path: String?) {
+    fun dispatch(path: String?, direct: Boolean) {
         val turn = handler
         if (turn == null) {
             android.util.Log.i("JarvisVoice", "result=no_activity")
         } else {
-            turn(path)
+            turn(path, direct)
         }
     }
 }

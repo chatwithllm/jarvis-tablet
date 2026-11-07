@@ -58,8 +58,8 @@ Optional realtime is still not started.
   Common Voice not downloadable in a usable form; GigaSpeech gated.
 - **The tablet detector no longer uses `hey_jack.onnx`.** That model does
   not fire on real speech. Wake detection is a Vosk small en-US grammar
-  (`VoskWakeEngine`): armed phrases default to hey jack, hey tablet, and
-  okay computer; hey jarvis is a reject and must not wake this tablet.
+  (`VoskWakeEngine`): armed phrases default to okay computer, hey tablet,
+  and hey jack; hey jarvis is a reject and must not wake this tablet.
   Confidence is configurable (default 0.85). On-device WAV inject and the
   desktop espeak loop are in `docs/wake-vosk-test.md`. Human recordings in
   `docs/human-recordings.md` are not required for this detector.
@@ -71,7 +71,9 @@ Optional realtime is still not started.
 - The owner approved Phase 4. This slice is the direct conversation client.
   Optional realtime is still not started.
 - When the LLM bearer is saved, a tap-to-talk / wake turn uses on-device
-  `SpeechRecognizer`, then `POST {base}/chat/completions`, then on-device
+  `SpeechRecognizer` when the device has one, otherwise the bundled Vosk
+  small en-US model in free-form mode (no grammar), then
+  `POST {base}/chat/completions`, then on-device
   `TextToSpeech`. When that bearer is missing, speech recognition cannot
   start, or the chat call fails (401/403, unreachable), the turn falls
   back to the Mini voice relay. A failed direct attempt listens a second

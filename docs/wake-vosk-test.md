@@ -2,7 +2,7 @@
 
 The tablet no longer scores `hey_jack.onnx`. Wake detection is a
 grammar-restricted Vosk small en-US recognizer (`VoskWakeEngine`).
-Armed phrases default to **hey jack**, **hey tablet**, and **okay computer**.
+Armed phrases default to **okay computer**, **hey tablet**, and **hey jack** (okay computer first; hey jack stays armed but is the weakest on non-US accents).
 **hey jarvis** is in the grammar only as a reject: this tablet must not
 wake on it.
 
@@ -75,15 +75,21 @@ Settings (debug builds): a gear on the dock, or a long-press on the clock.
 `adb shell am start -n net.npalakurla.jarvis.tablet/.SettingsActivity`
 opens Settings without retyping a saved token (the field shows `saved`).
 
-A full voice turn from a WAV, with no microphone, logs `JarvisVoice`:
+A full voice turn from a WAV, with no microphone, logs `JarvisVoice`.
+`--ez direct true` transcribes the clip with the bundled Vosk model (no
+grammar) and posts that text to `/llm/v1`. Without the extra, the WAV is
+posted to the relay. A 401 or 403 on the direct path still falls back to
+the relay. An unsafe transcript (`unlock`, `disarm`, `open garage`,
+`lock.*`, `cover.garage*`, `alarm_control_panel.*`) logs
+`JarvisVoice: refused=safety` and is not sent.
 
 ```bash
 adb shell am broadcast -a net.npalakurla.jarvis.tablet.DEBUG_TURN_WAV \
-  --es path "$DEST/x.wav"
+  --es path "$DEST/x.wav" --ez direct true
 adb logcat -d -s JarvisVoice:I
 ```
 
-`path=relay` is used when the LLM token is missing and when `/llm/v1` returns 401 or 403.
+`path=relay` is used when the LLM token is missing and when `/llm/v1` returns 401 or 403. On a device with no Android SpeechRecognizer, a live direct turn records PCM and uses the same free-form Vosk model (`stt=vosk`) before `/llm/v1`. Token fields are password inputs; `content-desc` is `field_llm_token` and `field_cf_token`. The HUD hint says “okay computer”.
 
 If the broadcast is dropped, add the package:
 

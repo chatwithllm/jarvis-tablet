@@ -42,8 +42,8 @@ JAVA_HOME = os.environ.get("JAVA_HOME") or os.path.expanduser("~/workspace/.jdk1
 KOTLINC_HOME = os.environ.get("KOTLINC_HOME") or os.path.expanduser("~/workspace/.kotlin/kotlinc")
 
 PACKAGE = "net.npalakurla.jarvis.tablet"
-VERSION_CODE = "4"
-VERSION_NAME = "0.4.2-settings-voice"
+VERSION_CODE = "5"
+VERSION_NAME = "0.4.3-vosk-stt"
 MIN_SDK = "30"
 TARGET_SDK = "34"
 
