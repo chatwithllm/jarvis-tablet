@@ -1,3 +1,6 @@
+import java.net.URI
+import java.security.MessageDigest
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -101,10 +104,10 @@ val downloadVoskModel by tasks.registering {
         val zip = layout.buildDirectory.file("downloads/vosk-model-small-en-us-0.15.zip").get().asFile
         zip.parentFile.mkdirs()
         if (!zip.exists() || sha256File(zip) != expected) {
-            java.net.URI("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip")
+            URI("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip")
                 .toURL()
                 .openStream()
-                .use { input -> zip.outputStream().use { input.copyTo(it) } }
+                .use { input -> zip.outputStream().use { output -> input.copyTo(output) } }
             val got = sha256File(zip)
             if (got != expected) {
                 zip.delete()
@@ -127,7 +130,7 @@ val downloadVoskModel by tasks.registering {
 }
 
 fun sha256File(file: File): String {
-    val digest = java.security.MessageDigest.getInstance("SHA-256")
+    val digest = MessageDigest.getInstance("SHA-256")
     file.inputStream().use { input ->
         val buf = ByteArray(1 shl 16)
         while (true) {
@@ -136,7 +139,7 @@ fun sha256File(file: File): String {
             digest.update(buf, 0, n)
         }
     }
-    return digest.digest().joinToString("") { "%02x".format(it) }
+    return digest.digest().joinToString("") { byte -> "%02x".format(byte) }
 }
 
 tasks.named("preBuild").configure {
