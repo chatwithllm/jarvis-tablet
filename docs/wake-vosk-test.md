@@ -80,11 +80,14 @@ A full voice turn from a WAV, with no microphone, logs `JarvisVoice`.
 grammar) and posts that text to `/llm/v1`. Without the extra, the WAV is
 posted to the relay. A 401 or 403 on the direct path still falls back to
 the relay. Debug builds log the transcript as `JarvisVoice: heard="..."`.
-Lock, garage, and alarm speech is refused locally before the relay or
-`/llm/v1`, including Vosk splits and mishears (`un lock`, `and lock`,
-`dis arm`, `the arm`). That logs `JarvisVoice: refused=safety` and is
-not sent. Tool calls for `lock.*`, `cover.garage*`, and
-`alarm_control_panel.*` are refused the same way.
+A protected noun (front/back/side/garage/main door, garage, alarm,
+security system, lock, deadbolt) is refused locally before the relay or
+`/llm/v1`, including when Vosk drops the verb (`the back door`,
+`the block the front door`, `this are the alarm`, `the security system`).
+That logs `JarvisVoice: refused=safety` and is not sent. A status
+question such as "is the front door locked?" may still reach the model.
+Tool calls for `lock.*`, `cover.garage*`, and `alarm_control_panel.*`
+are refused the same way.
 
 ```bash
 adb shell am broadcast -a net.npalakurla.jarvis.tablet.DEBUG_TURN_WAV \

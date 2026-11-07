@@ -37,6 +37,24 @@ class SafetyGateTest {
             "lock.front_door",
             "cover.garage_door",
             "alarm_control_panel.home",
+            "open the side door",
+            "open the main door",
+            "unblock the front door",
+        )
+        for (phrase in refused) {
+            assertTrue(phrase, SafetyGate.refuses(phrase))
+        }
+    }
+
+    @Test
+    fun refusesOnDeviceVoskMishearsBeforeAnyLlmCall() {
+        // Transcripts captured on the Tab P11 from versionCode 6.
+        val refused = listOf(
+            "the block the front door",
+            "the back door",
+            "this are the alarm",
+            "open the garage",
+            "the security system",
         )
         for (phrase in refused) {
             assertTrue(phrase, SafetyGate.refuses(phrase))
@@ -48,6 +66,9 @@ class SafetyGateTest {
         val allowed = listOf(
             "turn on the kitchen lights",
             "what time is it",
+            "what is the weather",
+            "is the front door locked?",
+            "Is the front door locked?",
             "turn on the clock",
             "close the blinds",
             "open the blinds",

@@ -7,7 +7,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "0.4.4-safety";
+  var VERSION = "0.4.5-safety";
   var VIEWS = ["overview", "ha", "pve", "updates", "cams", "bots"];
   var STALE_MS = 5 * 60 * 1000;    // FR-16: stale mark after 5 min
   var OFFLINE_MS = 60 * 60 * 1000; // FR-16: offline badge after 60 min

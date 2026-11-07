@@ -77,6 +77,16 @@ class ContextForgeLlmTransport(private val context: Context) {
     }
 
     private fun completeBlocking(transcript: String): VoiceTurn.TurnResult {
+        // Noun gate again, in case a caller skipped VoiceTurn. No HTTP.
+        if (SafetyGate.refuses(transcript)) {
+            Log.i("JarvisVoice", "refused=safety")
+            return VoiceTurn.TurnResult(
+                transcript = transcript,
+                responseText = "That is not allowed by voice.",
+                ttsAudio = null,
+                proposedAction = null,
+            )
+        }
         val token = TokenStore.getLlmToken(context)
             ?: throw LlmCallFailed(0, "llm token missing")
         val model = TokenStore.getLlmModel(context)
