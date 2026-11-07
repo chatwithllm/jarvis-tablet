@@ -42,8 +42,8 @@ JAVA_HOME = os.environ.get("JAVA_HOME") or os.path.expanduser("~/workspace/.jdk1
 KOTLINC_HOME = os.environ.get("KOTLINC_HOME") or os.path.expanduser("~/workspace/.kotlin/kotlinc")
 
 PACKAGE = "net.npalakurla.jarvis.tablet"
-VERSION_CODE = "7"
-VERSION_NAME = "0.4.5-safety"
+VERSION_CODE = "8"
+VERSION_NAME = "0.4.6-cloud-voice"
 MIN_SDK = "30"
 TARGET_SDK = "34"
 
@@ -387,6 +387,7 @@ def main():
         "Landroidx/appcompat/R$drawable;",
         "Lnet/npalakurla/jarvis/tablet/MainActivity;",
         "Lnet/npalakurla/jarvis/tablet/ContextForgeLlmTransport;",
+        "Lnet/npalakurla/jarvis/tablet/CloudVoice;",
         "Lnet/npalakurla/jarvis/tablet/DeviceSpeech;",
         "Lnet/npalakurla/jarvis/tablet/RoutingVoiceTransport;",
         "Landroidx/appcompat/app/AppCompatActivity;",

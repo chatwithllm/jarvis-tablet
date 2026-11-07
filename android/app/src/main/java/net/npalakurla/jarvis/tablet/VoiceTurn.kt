@@ -178,14 +178,13 @@ class VoiceTurn(
         WakeService.muteTailMs = TURN_MUTE_MS
         turnJob = scope.launch {
             try {
-                val heard = VoskWakeEngine.transcribe(context, pcm)
+                val heard = transcribeWav(wav, pcm)
                 if (SafetyGate.block(heard)) {
                     showRefused()
                     return@launch
                 }
                 if (direct) {
                     Log.i(VOICE, "path=direct")
-                    Log.i(VOICE, "stt=vosk")
                     if (heard.isNullOrBlank()) {
                         Log.i(VOICE, "result=silent")
                         bridge.sendEvent("tts_finished", JSONObject())
@@ -393,7 +392,8 @@ class VoiceTurn(
             bridge.sendEvent("tts_finished", JSONObject())
             return RelayAttempt.Silent
         }
-        val heard = wavToPcm(audio)?.let { pcm16leToShorts(it) }?.let { VoskWakeEngine.transcribe(context, it) }
+        val shorts = wavToPcm(audio)?.let { pcm16leToShorts(it) }
+        val heard = if (shorts != null) transcribeWav(audio, shorts) else null
         if (SafetyGate.block(heard)) {
             showRefused()
             return RelayAttempt.Refused
@@ -403,6 +403,21 @@ class VoiceTurn(
         val value = result.getOrElse { return RelayAttempt.Failed(it) }
         present(value)
         return RelayAttempt.Presented
+    }
+
+    /** Cloud STT first. Vosk free-form is the offline fallback. */
+    private fun transcribeWav(wav: ByteArray, pcm: ShortArray): String? {
+        if (TokenStore.hasLlmCredentials(context)) {
+            when (val cloud = CloudVoice.transcribeWav(context, wav)) {
+                is CloudVoice.Stt.Ok -> {
+                    Log.i(VOICE, "stt=cloud")
+                    return cloud.text.trim().ifEmpty { null }
+                }
+                CloudVoice.Stt.Unavailable -> Unit
+            }
+        }
+        Log.i(VOICE, "stt=vosk")
+        return VoskWakeEngine.transcribe(context, pcm)
     }
 
     private fun showRefused() {

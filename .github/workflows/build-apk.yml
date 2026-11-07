@@ -102,6 +102,7 @@ jobs:
           mkdir -p /tmp/dexcheck && cd /tmp/dexcheck && unzip -o -q "$GITHUB_WORKSPACE/android/$apk" 'classes*.dex'
           for cls in 'Landroidx/appcompat/R$drawable;' 'Lnet/npalakurla/jarvis/tablet/MainActivity;' \
             'Lnet/npalakurla/jarvis/tablet/ContextForgeLlmTransport;' \
+            'Lnet/npalakurla/jarvis/tablet/CloudVoice;' \
             'Lnet/npalakurla/jarvis/tablet/DeviceSpeech;' \
             'Lnet/npalakurla/jarvis/tablet/RoutingVoiceTransport;' \
             'Lnet/npalakurla/jarvis/tablet/VoskWakeEngine;' \

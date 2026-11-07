@@ -9,7 +9,9 @@ import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ArrayAdapter
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -53,6 +55,20 @@ class SettingsActivity : AppCompatActivity() {
         }
         val llmModelInput = field("LLM model (default grok-4.7)", R.id.field_llm_model).apply {
             setText(TokenStore.getLlmModel(this@SettingsActivity))
+        }
+        val voiceChoices = JarvisVoices.CHOICES
+        val voiceSpinner = Spinner(this).apply {
+            id = R.id.field_tts_voice
+            contentDescription = "field_tts_voice"
+            importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+            adapter = ArrayAdapter(
+                this@SettingsActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                voiceChoices.map { it.label },
+            )
+            val current = JarvisVoices.selectedId(this@SettingsActivity)
+            val index = voiceChoices.indexOfFirst { it.id == current }.coerceAtLeast(0)
+            setSelection(index)
         }
         val llmSaved = TokenStore.hasLlmCredentials(this)
         val llmTokenInput = secretField(
@@ -147,6 +163,8 @@ class SettingsActivity : AppCompatActivity() {
                     llmToken,
                     llmModel.ifEmpty { TokenStore.DEFAULT_LLM_MODEL },
                 )
+                val voiceIndex = voiceSpinner.selectedItemPosition.coerceIn(0, voiceChoices.lastIndex)
+                JarvisVoices.save(this@SettingsActivity, voiceChoices[voiceIndex].id)
                 WakeConfig.save(this@SettingsActivity, enabledPhrases, wakeConf)
                 startActivity(
                     Intent(this@SettingsActivity, MainActivity::class.java)
@@ -185,6 +203,12 @@ class SettingsActivity : AppCompatActivity() {
             addView(llmUrlInput)
             addView(llmModelInput)
             addView(llmTokenInput)
+            addView(TextView(context).apply {
+                text = "Spoken voice (cloud TTS, stock preset — not a cloned actor)"
+                textSize = 18f
+                setPadding(0, 28, 0, 8)
+            })
+            addView(voiceSpinner)
             addView(llmState)
             addView(clearLlm)
             addView(TextView(context).apply {
