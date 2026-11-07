@@ -1,6 +1,6 @@
 # TTS route checklist for IT Admin
 
-Artifact: `contextforge-1.1.0-tts.patch` (version `1.1.0+tablet-tts.5`). The sha256, byte count, and line count are in `ARTIFACT.txt` next to the patch. Recompute them before review; do not trust a copied hash from chat.
+Artifact: `contextforge-1.1.0-tts.patch` (version `1.1.0+tablet-tts.6`). The sha256, byte count, and line count are in `ARTIFACT.txt` next to the patch. Recompute them before review; do not trust a copied hash from chat.
 
 This is a review package. Deploy, restart, permission changes, Caddy edits, and any call to xAI are not approved.
 
@@ -55,7 +55,7 @@ Gaps, not fixed here:
 
 - The app still calls `POST /llm/v1/stt`. This patch does not add STT, so that call stays 403 or 404 and the app keeps using Vosk. That is intentional.
 - The app will accept a JSON body that starts with `{` and try to base64-decode an `audio` field. This route refuses `with_timestamps`, so a success body is raw MP3 (`audio/mpeg`), which the app plays as bytes. Do not enable timestamps later without an app change.
-- The app's read timeout is 40 seconds. This route's upstream timeout is 30 seconds, so the app should see a finished error rather than hang.
+- The app's read timeout is 40 seconds. The router's awaiter returns at 35 seconds. That 504 is for the waiter. The worker can still be inside DNS, headers, or a chunk read, and it still holds its slot.
 
 ## Backup
 
@@ -72,13 +72,24 @@ IT also confirmed the backend listens on `127.0.0.1:4449` and Caddy on port 4444
 
 One serving process was evidenced. There is no confirmed `--workers` value, and the configured maximum is unknown. The in-flight cap (2) and the per-minute cap (30) are per process. They are not global across workers, and they reset when the process restarts. A second worker would double both caps.
 
-Key Keeper confirmed the active RBAC role is global `platform_admin` with permissions `*`, which grants `llm.invoke`. The token's team is null. Its scopes and `192.168.20.109/32` pin are unchanged. That is still not proof that this provider may call speech. Provider-console approval is pending. No paid call was made.
+Key Keeper confirmed the active RBAC role is global `platform_admin` with permissions `*`, which grants `llm.invoke`. The token's team is null. Its scopes and `192.168.20.109/32` pin are unchanged.
 
-## Cancellation and billing
+An authorized metadata `GET` returned HTTP 200. It reports the key `HeyJohn` as active, with ACL entries for voice, chat, and models. The provider docs do not map that voice ACL onto TTS. The GET is not a generation. No further use of the key is authorized, and no speech call was made.
 
-`asyncio.wait_for` around `asyncio.to_thread` does not kill the worker thread and does not undo upstream work. The router's 35 second wait is only a backstop for the awaiting task. The worker's own deadline (30 seconds unless constructed with another timeout) bounds the socket.
+## What is actually bounded
 
-The body is read one byte at a time, and the socket timeout is set to the time remaining before each read. A peer that trickles a byte every few tens of milliseconds cannot sit inside `read(65536)` until the buffer fills. A peer that sends nothing returns when that socket timeout fires. The slot stays taken until the read returns, the response is closed, and the thread exits. A late body is discarded. Closing the socket does not cancel a provider bill, and this process cannot force the thread to die any sooner than the socket call returns.
+These are the limits the code holds. They are not a deadline around the whole upstream call.
+
+- The awaiter stops waiting at 35 seconds and that waiter gets 504. `asyncio.wait_for` does not kill the worker thread.
+- Two in-flight slots per process. The third call raises "too many speech requests" and does not open upstream. A slot is returned only when that worker leaves the upstream call, closes the response, and returns. Cancelling the waiter does not free it. Both slots can stay taken until the OS or the network finishes the call the thread is blocked in. The caps reset when the process restarts. They are not global. A second process would double them. The configured worker maximum is still unknown; one serving process was evidenced.
+- The response copy stops past 10 MiB, closes, and returns 502. Each pull is at most 64 KiB (`read1` when the object has it; a Content-Length `HTTPResponse` uses `fp.read1`; a chunked `HTTPResponse` uses `read`). That is a buffer bound, not a promise that one pull returns by a clock.
+- A tablet upload with `Content-Length` over 64 KiB is rejected before the stream is iterated. A stream is copied only until 64 KiB. The handler does not call `request.body()`. A trickle under that cap is not given its own timer. The ASGI server may already have accepted bytes this handler never concatenates.
+- `urlopen` is given a socket timeout (30 seconds, or whatever remains on the worker clock when the call starts). That timeout is per recv. It is not a deadline for DNS, for the sum of a trickled status line, or for a chunk frame. A timeout raised there, or during a later read, is 502, not 504. The 504 from the worker clock runs only between those calls, after one of them has returned.
+- There is no lookup of a private socket. If `read1` is missing, nothing silently adds a timeout.
+- The production logger is a no-op. This handler does not emit text, audio, keys, or a status line.
+- A failed TTS import mounts 503 for `POST /tts` and leaves `POST /llm/v1/chat/completions` in place.
+
+Closing a response does not reverse a provider bill. This process cannot force the thread to stop.
 
 ## Install (not approved)
 
@@ -100,7 +111,7 @@ curl -sS -D - -o /tmp/out.mp3 -X POST \
   -d '{"text":"Good evening.","voice_id":"leo","language":"en","speed":1.08,"output_format":{"codec":"mp3","sample_rate":24000,"bit_rate":128000}}'
 ```
 
-Expect HTTP 200 and `Content-Type: audio/mpeg` only after a future approved restart. That result is not claimed here. If it is ever run, logs from this route must be status and size only, even if gateway logging is on. They must not show the text, the audio, or either bearer. Provider health remains unverified until that separate decision.
+Expect HTTP 200 and `Content-Type: audio/mpeg` only after a future approved restart. That result is not claimed here. This handler's logger is a no-op, so the route itself does not emit the text, the audio, or either bearer. No further key use is authorized. The metadata GET is not that proof.
 
 From any other source address:
 

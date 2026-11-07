@@ -37,6 +37,11 @@ from mcpgateway.utils.verify_credentials import (
 
 llm_tts_router = APIRouter()
 _proxy = TtsProxy()
+# Tablet JSON is a few kilobytes. Stop copying an upload before request.body()
+# would concatenate it. A slow body under this cap is not timed out here.
+MAX_REQUEST_BYTES = 64 * 1024
+# wait_for returns to the awaiter. It does not stop the worker thread.
+AWAITER_TIMEOUT_SECONDS = 35
 
 
 class TtsBody(BaseModel):
@@ -105,6 +110,33 @@ def _provider_view(db: Session) -> dict | None:
 _BODY_KEYS = frozenset({"text", "language", "voice_id", "speed", "output_format", "with_timestamps"})
 
 
+async def _read_request(request: Request) -> bytes:
+    """Copy the body only up to MAX_REQUEST_BYTES.
+
+    A declared Content-Length over the cap does not iterate the stream.
+    This does not drain bytes the ASGI server already accepted, and it
+    does not bound how long a smaller trickle may take.
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            size = int(declared)
+        except ValueError:
+            raise HTTPException(status_code=413, detail="TTS request is too large") from None
+        if size < 0 or size > MAX_REQUEST_BYTES:
+            raise HTTPException(status_code=413, detail="TTS request is too large")
+    chunks = []
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        if total + len(chunk) > MAX_REQUEST_BYTES:
+            raise HTTPException(status_code=413, detail="TTS request is too large")
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
 def _parse_body(raw: bytes) -> TtsBody:
     """Validate JSON without echoing the caller's text back in the error."""
     try:
@@ -139,7 +171,7 @@ async def text_to_speech(
         raise HTTPException(status_code=401, detail="Authorization token required")
     # Query keys only. Do not treat the Authorization header as an override.
     override = tuple(key for key in FORBIDDEN_OVERRIDE_KEYS if key in request.query_params)
-    body = _parse_body(await request.body())
+    body = _parse_body(await _read_request(request))
     try:
         restrictions = await _ip_restrictions(request)
         access = AccessRequest(
@@ -165,7 +197,7 @@ async def text_to_speech(
                 body.output_format,
                 body.with_timestamps,
             ),
-            timeout=35,
+            timeout=AWAITER_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="TTS deadline exceeded") from None

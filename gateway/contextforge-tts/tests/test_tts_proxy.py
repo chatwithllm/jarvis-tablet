@@ -610,126 +610,76 @@ class TtsProxyTests(unittest.TestCase):
         self.assertTrue(late.closed)
         self.assertNotIn("LATECANARY", caught.exception.detail)
 
-    def _socket_response(self, client_sock, server_sock):
-        fp = client_sock.makefile("rb")
-        closed = {"value": False}
+    def test_read1_uses_one_bounded_buffer(self):
+        sizes = []
 
-        class Response:
+        class Blocks:
             status = 200
             headers = {"Content-Type": "audio/mpeg"}
+            closed = False
 
-            def read(self, n=1):
-                return fp.read(n)
+            def read1(self, size):
+                sizes.append(size)
+                if len(sizes) > 2:
+                    return b""
+                return b"a" * 8
 
             def close(self):
-                closed["value"] = True
-                try:
-                    fp.close()
-                except Exception:
-                    pass
-                for sock in (client_sock, server_sock):
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
+                self.closed = True
 
-        response = Response()
-        response.fp = fp
-        return response, closed
-
-    def test_slow_trickle_stays_inside_the_deadline(self):
-        import socket
-        import time
-
-        client_sock, server_sock = socket.socketpair()
-        client_sock.settimeout(30)
-        response, closed = self._socket_response(client_sock, server_sock)
-
-        def trickle():
-            try:
-                for _ in range(40):
-                    server_sock.send(b"\xff")
-                    time.sleep(0.05)
-                server_sock.shutdown(socket.SHUT_WR)
-            except Exception:
-                return
-
-        threading.Thread(target=trickle, daemon=True).start()
-        client = proxy.TtsProxy(timeout=1.0, max_per_minute=100)
-        started = time.monotonic()
-        with self.assertRaises(proxy.SpeechDenied) as caught:
-            client.speak(_access(), _provider(), "TRICKLE_CANARY", "en", "leo", opener=lambda request, timeout=None: response)
-        elapsed = time.monotonic() - started
-        self.assertEqual(caught.exception.status, 504)
-        self.assertLess(elapsed, 1.5)
-        self.assertTrue(closed["value"])
-        self.assertEqual(client._slots, 2)
-        self.assertNotIn("TRICKLE_CANARY", caught.exception.detail)
-        self.assertNotIn("xff", caught.exception.detail.lower())
-
-    def test_blocked_read_times_out_with_the_deadline_and_releases_the_slot(self):
-        import socket
-        import time
-
-        client_sock, server_sock = socket.socketpair()
-        client_sock.settimeout(5)
-        response, closed = self._socket_response(client_sock, server_sock)
-        started_read = threading.Event()
-        original = response.read
-
-        def read(n=1):
-            started_read.set()
-            return original(n)
-
-        response.read = read
-        client = proxy.TtsProxy(timeout=0.4, max_in_flight=1, max_per_minute=100)
-        holder = {}
-
-        def run():
-            try:
-                client.speak(
-                    _access(),
-                    _provider(),
-                    "BLOCK_CANARY",
-                    "en",
-                    "leo",
-                    opener=lambda request, timeout=None: response,
-                )
-            except proxy.SpeechDenied as exc:
-                holder["exc"] = exc
-
-        started = time.monotonic()
-        worker = threading.Thread(target=run)
-        worker.start()
-        self.assertTrue(started_read.wait(1))
-        calls = []
-        with self.assertRaises(proxy.SpeechBusy):
-            client.speak(
-                _access(),
-                _provider(),
-                "Other",
-                "en",
-                "leo",
-                opener=lambda request, timeout=None: calls.append(1),
-            )
-        self.assertEqual(calls, [])
-        worker.join(2)
-        self.assertFalse(worker.is_alive())
-        elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 1.5)
-        self.assertEqual(holder["exc"].status, 504)
-        self.assertTrue(closed["value"])
-        self.assertEqual(client._slots, 1)
-        self.assertNotIn("BLOCK_CANARY", holder["exc"].detail)
-        follow = client.speak(
+        body = Blocks()
+        result = proxy.TtsProxy().speak(
             _access(),
             _provider(),
             "Hi",
             "en",
             "leo",
-            opener=lambda request, timeout=None: _Response(),
+            opener=lambda request, timeout=None: body,
         )
-        self.assertEqual(follow.status, 200)
+        self.assertEqual(result.body, b"aaaaaaaaaaaaaaaa")
+        self.assertEqual(sizes, [proxy.BODY_READ_BYTES, proxy.BODY_READ_BYTES, proxy.BODY_READ_BYTES])
+        self.assertGreaterEqual(proxy.BODY_READ_BYTES, 4096)
+        self.assertTrue(body.closed)
+
+    def test_read_timeout_is_502_not_504(self):
+        class Slow:
+            status = 200
+            headers = {"Content-Type": "audio/mpeg"}
+            closed = False
+
+            def read1(self, _size):
+                raise TimeoutError("stalled")
+
+            def close(self):
+                self.closed = True
+
+        slow = Slow()
+        with self.assertRaises(proxy.SpeechDenied) as caught:
+            proxy.TtsProxy().speak(
+                _access(),
+                _provider(),
+                "Hi",
+                "en",
+                "leo",
+                opener=lambda request, timeout=None: slow,
+            )
+        self.assertEqual(caught.exception.status, 502)
+        self.assertNotIn("stalled", caught.exception.detail)
+        self.assertTrue(slow.closed)
+
+    def test_opener_timeout_is_502_not_504(self):
+        def opener(request, timeout=None):
+            raise TimeoutError("slow-dns")
+
+        with self.assertRaises(proxy.SpeechDenied) as caught:
+            proxy.TtsProxy().speak(_access(), _provider(), "Hi", "en", "leo", opener=opener)
+        self.assertEqual(caught.exception.status, 502)
+        self.assertNotIn("slow-dns", caught.exception.detail)
+
+    def test_proxy_does_not_touch_a_private_socket(self):
+        text = PROXY_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("_sock", text)
+        self.assertNotIn("settimeout", text)
 
     def test_oversized_upstream_body_is_closed_and_not_returned(self):
         class Big:
@@ -782,6 +732,156 @@ class TtsProxyTests(unittest.TestCase):
         )
 
 
+class HttpResponseResidualTests(unittest.TestCase):
+    """Local HTTPResponse only. These expose limits. They do not call xAI."""
+
+    def _serve(self, write):
+        import socket
+
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        server.settimeout(3)
+        port = server.getsockname()[1]
+
+        def accept():
+            try:
+                conn, _addr = server.accept()
+            except OSError:
+                return
+            try:
+                conn.settimeout(3)
+                buffered = b""
+                while b"\r\n\r\n" not in buffered and len(buffered) < 8192:
+                    block = conn.recv(4096)
+                    if not block:
+                        break
+                    buffered += block
+                write(conn)
+            except Exception:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        thread = threading.Thread(target=accept, daemon=True)
+        thread.start()
+        self.addCleanup(server.close)
+        self.addCleanup(lambda: thread.join(2))
+        return port
+
+    def test_trickled_headers_outlive_the_socket_timeout(self):
+        import time
+        import urllib.request
+
+        def write(conn):
+            status = b"HTTP/1.1 200 OK\r\n"
+            for index in range(len(status)):
+                conn.send(status[index : index + 1])
+                time.sleep(0.04)
+            conn.sendall(b"Content-Length: 2\r\nContent-Type: audio/mpeg\r\nConnection: close\r\n\r\nOK")
+
+        port = self._serve(write)
+        started = time.monotonic()
+        with urllib.request.urlopen("http://127.0.0.1:%s/" % port, timeout=0.2) as response:
+            body = response.read()
+        elapsed = time.monotonic() - started
+        print("MEASURE trickled_headers elapsed=%.3f socket_timeout=0.2" % elapsed)
+        self.assertEqual(body, b"OK")
+        self.assertGreater(elapsed, 0.45)
+        self.assertLess(elapsed, 3)
+
+    def test_chunked_frame_outlives_a_short_socket_timeout(self):
+        import time
+        import urllib.request
+
+        def write(conn):
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Transfer-Encoding: chunked\r\n"
+                b"Content-Type: audio/mpeg\r\n"
+                b"Connection: close\r\n\r\n"
+                b"8\r\n"
+            )
+            for byte in b"ABCDEFGH":
+                conn.send(bytes([byte]))
+                time.sleep(0.04)
+            conn.sendall(b"\r\n0\r\n\r\n")
+
+        port = self._serve(write)
+        started = time.monotonic()
+        with urllib.request.urlopen("http://127.0.0.1:%s/" % port, timeout=0.15) as response:
+            self.assertIs(response.chunked, True)
+            body = proxy._read_bounded(
+                response,
+                proxy.MAX_RESPONSE_BYTES,
+                None,
+                time.monotonic() + 5,
+            )
+        elapsed = time.monotonic() - started
+        print("MEASURE chunked_frame elapsed=%.3f socket_timeout=0.15" % elapsed)
+        self.assertEqual(body, b"ABCDEFGH")
+        self.assertGreater(elapsed, 0.25)
+        self.assertLess(elapsed, 3)
+
+    def test_content_length_read_stays_bounded(self):
+        import time
+        import tracemalloc
+        import urllib.request
+
+        payload = b"Z" * (256 * 1024)
+
+        def write(conn):
+            head = (
+                "HTTP/1.1 200 OK\r\nContent-Length: %s\r\n"
+                "Content-Type: audio/mpeg\r\nConnection: close\r\n\r\n" % len(payload)
+            ).encode("ascii")
+            conn.sendall(head)
+            view = memoryview(payload)
+            offset = 0
+            while offset < len(view):
+                sent = conn.send(view[offset : offset + 16384])
+                if sent <= 0:
+                    break
+                offset += sent
+
+        port = self._serve(write)
+        with urllib.request.urlopen("http://127.0.0.1:%s/" % port, timeout=2) as response:
+            self.assertIs(response.chunked, False)
+            sizes = []
+            original = response.fp.read1
+
+            def wrapped(size):
+                sizes.append(size)
+                return original(size)
+
+            response.fp.read1 = wrapped
+            tracemalloc.start()
+            started = time.perf_counter()
+            body = proxy._read_bounded(
+                response,
+                proxy.MAX_RESPONSE_BYTES,
+                None,
+                time.monotonic() + 5,
+            )
+            elapsed = time.perf_counter() - started
+            _current, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+        print(
+            "MEASURE content_length bytes=%s elapsed=%.3f peak=%s reads=%s chunk=%s"
+            % (len(body), elapsed, peak, len(sizes), proxy.BODY_READ_BYTES)
+        )
+        self.assertEqual(body, payload)
+        self.assertGreaterEqual(len(sizes), 2)
+        self.assertLess(len(sizes), 64)
+        self.assertTrue(all(size <= proxy.BODY_READ_BYTES for size in sizes))
+        self.assertLess(elapsed, 1.0)
+        self.assertLess(peak, 2 * 1024 * 1024)
+
+
 class PatchRegressionTests(unittest.TestCase):
     def test_router_is_tts_only_and_uses_llm_invoke(self):
         text = ROUTER_PATH.read_text(encoding="utf-8")
@@ -819,7 +919,7 @@ class PatchRegressionTests(unittest.TestCase):
         self.assertEqual(recorded["sha256"], hashlib.sha256(raw).hexdigest())
         self.assertEqual(int(recorded["bytes"]), len(raw))
         self.assertEqual(int(recorded["lines"]), raw.count(b"\n"))
-        self.assertEqual(recorded["version"], "1.1.0+tablet-tts.5")
+        self.assertEqual(recorded["version"], "1.1.0+tablet-tts.6")
 
 
 if __name__ == "__main__":

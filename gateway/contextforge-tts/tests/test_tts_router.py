@@ -184,6 +184,54 @@ class RouterHttpTests(unittest.TestCase):
         spec.loader.exec_module(cls.router_mod)
         cls.default_proxy = cls.router_mod._proxy
 
+    def test_request_stream_stops_at_the_cap(self):
+        import asyncio
+
+        pulled = {"n": 0}
+
+        class Request:
+            headers = {}
+
+            async def stream(self):
+                for _index in range(100):
+                    pulled["n"] += 1
+                    yield b"Y" * 1024
+
+        with self.assertRaises(HTTPException) as caught:
+            asyncio.run(self.router_mod._read_request(Request()))
+        self.assertEqual(caught.exception.status_code, 413)
+        self.assertLess(pulled["n"], 80)
+        self.assertNotIn("Y", str(caught.exception.detail))
+
+    def test_declared_length_does_not_iterate_the_stream(self):
+        import asyncio
+
+        class Request:
+            headers = {"content-length": str(self.router_mod.MAX_REQUEST_BYTES + 1)}
+
+            async def stream(self):
+                raise AssertionError("stream iterated")
+                yield b""
+
+        with self.assertRaises(HTTPException) as caught:
+            asyncio.run(self.router_mod._read_request(Request()))
+        self.assertEqual(caught.exception.status_code, 413)
+        self.assertEqual(caught.exception.detail, "TTS request is too large")
+
+    def test_oversized_post_is_413_before_upstream(self):
+        raw = b'{"text":"' + (b"C" * 70000) + b'","language":"en","voice_id":"leo"}'
+        response = self.client.post(
+            "/llm/v1/tts",
+            content=raw,
+            headers={
+                "Authorization": "Bearer " + TABLET_BEARER,
+                "Content-Type": "application/json",
+            },
+        )
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(self.audio.calls, [])
+        self.assertNotIn("CCCC", response.text)
+
     def test_router_ships_with_the_noop_logger(self):
         self.assertIs(self.default_proxy._log, self.proxy._noop_log)
 
