@@ -284,6 +284,56 @@ class RouterHttpTests(unittest.TestCase):
         self.assertEqual(response.json()["detail"], "Invalid TTS request")
 
 
+class MountIsolationTests(unittest.TestCase):
+    def test_router_import_failure_returns_503_and_chat_still_works(self):
+        import importlib.util
+
+        for name in ("mcpgateway", "mcpgateway.routers", "mcpgateway.services"):
+            if name not in sys.modules:
+                module = types.ModuleType(name)
+                module.__path__ = []
+                sys.modules[name] = module
+        spec = importlib.util.spec_from_file_location(
+            "mcpgateway.services.llm_tts_proxy_mount",
+            PROXY_PATH,
+        )
+        proxy = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = proxy
+        spec.loader.exec_module(proxy)
+        app = FastAPI()
+
+        @app.post("/llm/v1/chat/completions")
+        def chat():
+            return {"id": "chat-ok"}
+
+        saved = sys.modules.get("mcpgateway.routers.llm_tts_router")
+        sys.modules["mcpgateway.routers.llm_tts_router"] = types.ModuleType(
+            "mcpgateway.routers.llm_tts_router"
+        )
+        logs = []
+
+        class Logger:
+            def info(self, *_args, **_kwargs):
+                return None
+
+            def error(self, message, *args):
+                logs.append(message % args if args else message)
+
+        try:
+            status = proxy.mount_tts(app, "/llm/v1", Logger())
+        finally:
+            if saved is not None:
+                sys.modules["mcpgateway.routers.llm_tts_router"] = saved
+        self.assertEqual(status, "unavailable")
+        self.assertEqual(logs, ["LLM TTS router unavailable: ImportError"])
+        client = TestClient(app)
+        self.assertEqual(client.post("/llm/v1/chat/completions").json(), {"id": "chat-ok"})
+        denied = client.post("/llm/v1/tts", json={"text": TEXT_CANARY})
+        self.assertEqual(denied.status_code, 503)
+        self.assertEqual(denied.json()["detail"], "TTS unavailable")
+        self.assertNotIn(TEXT_CANARY, denied.text)
+
+
 class SafeOpenerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

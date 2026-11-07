@@ -190,7 +190,8 @@ class TtsProxyTests(unittest.TestCase):
         self.assertEqual(result.body, audio)
         self.assertEqual(seen["url"], "https://api.x.ai/v1/tts")
         self.assertEqual(seen["method"], "POST")
-        self.assertEqual(seen["timeout"], 30.0)
+        self.assertGreater(seen["timeout"], 29)
+        self.assertLessEqual(seen["timeout"], 30)
         auth = dict(seen["headers"]).get("Authorization")
         self.assertEqual(auth, "Bearer test-provider-key")
         self.assertNotIn("tablet-bearer", auth)
@@ -475,6 +476,100 @@ class TtsProxyTests(unittest.TestCase):
     def test_token_pin_is_not_a_second_hardcoded_address(self):
         proxy.authorize(_access(socket_ip="10.9.9.9", ip_restrictions=("10.9.9.9/32",)))
 
+    def test_cancelled_awaiters_do_not_free_live_upstream_slots(self):
+        import asyncio
+
+        entered = []
+        gates = []
+        guard = threading.Lock()
+
+        def opener(request, timeout=None):
+            with guard:
+                gate = threading.Event()
+                gates.append(gate)
+                entered.append(len(entered))
+            gate.wait(3)
+            response = _Response()
+            response.close = lambda: None
+            return response
+
+        client = proxy.TtsProxy(max_in_flight=2, max_per_minute=100, timeout=5)
+
+        async def one():
+            return await asyncio.to_thread(
+                client.speak,
+                _access(),
+                _provider(),
+                "Hi",
+                "en",
+                "leo",
+                opener=opener,
+            )
+
+        async def scenario():
+            workers = [asyncio.create_task(one()) for _ in range(2)]
+            for _ in range(100):
+                if len(entered) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(len(entered), 2)
+            for task in workers:
+                task.cancel()
+            await asyncio.sleep(0.05)
+            with self.assertRaises(proxy.SpeechBusy):
+                client.speak(_access(), _provider(), "Blocked", "en", "leo", opener=opener)
+            self.assertEqual(len(entered), 2)
+            gates[0].set()
+            for _ in range(100):
+                if client._slots >= 1:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertGreaterEqual(client._slots, 1)
+            third = asyncio.create_task(one())
+            for _ in range(100):
+                if len(entered) >= 3:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(len(entered), 3)
+            for gate in gates:
+                gate.set()
+            await asyncio.wait(workers + [third], timeout=2)
+
+        asyncio.run(scenario())
+
+    def test_deadline_discards_late_body_and_closes(self):
+        class Late:
+            def __init__(self):
+                self.closed = False
+
+            status = 200
+            headers = {"Content-Type": "audio/mpeg"}
+
+            def read(self, n=65536):
+                return b"LATECANARYAUDIO"
+
+            def close(self):
+                self.closed = True
+
+        late = Late()
+        gate = threading.Event()
+
+        def opener(request, timeout=None):
+            self.assertLessEqual(timeout, 0.05)
+            gate.wait(2)
+            return late
+
+        client = proxy.TtsProxy(timeout=0.05, max_per_minute=100)
+
+        timer = threading.Timer(0.08, gate.set)
+        timer.start()
+        self.addCleanup(timer.join)
+        with self.assertRaises(proxy.SpeechDenied) as caught:
+            client.speak(_access(), _provider(), "LATECANARYTEXT", "en", "leo", opener=opener)
+        self.assertEqual(caught.exception.status, 504)
+        self.assertTrue(late.closed)
+        self.assertNotIn("LATECANARY", caught.exception.detail)
+
     def test_oversized_upstream_body_is_closed_and_not_returned(self):
         class Big:
             def __init__(self):
@@ -562,7 +657,7 @@ class PatchRegressionTests(unittest.TestCase):
         self.assertEqual(recorded["sha256"], hashlib.sha256(raw).hexdigest())
         self.assertEqual(int(recorded["bytes"]), len(raw))
         self.assertEqual(int(recorded["lines"]), raw.count(b"\n"))
-        self.assertEqual(recorded["version"], "1.1.0+tablet-tts.3")
+        self.assertEqual(recorded["version"], "1.1.0+tablet-tts.4")
 
 
 if __name__ == "__main__":

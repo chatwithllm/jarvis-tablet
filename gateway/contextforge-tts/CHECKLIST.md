@@ -1,6 +1,6 @@
 # TTS route checklist for IT Admin
 
-Artifact: `contextforge-1.1.0-tts.patch` (version `1.1.0+tablet-tts.3`). The sha256, byte count, and line count are in `ARTIFACT.txt` next to the patch. Recompute them before review; do not trust a copied hash from chat.
+Artifact: `contextforge-1.1.0-tts.patch` (version `1.1.0+tablet-tts.4`). The sha256, byte count, and line count are in `ARTIFACT.txt` next to the patch. Recompute them before review; do not trust a copied hash from chat.
 
 This is a review package. Deploy, restart, permission changes, Caddy edits, and any call to xAI are not approved.
 
@@ -64,13 +64,22 @@ This patch does not change the database, the schema, or the provider row. Do not
 1. Record the image id or the supervisor unit, and the git revision if the tree is a checkout.
 2. Copy `mcpgateway/main.py` and `mcpgateway/middleware/token_scoping.py` to a directory outside the app tree. Those two files, plus deletion of the two new modules, are the rollback set.
 
-## Runtime facts still pending IT
+## Runtime facts
 
-These are not asserted by this artifact, because they were not measured here:
+IT confirmed the published patch at `7a463af` matched sha256 `a88ff204999cdcb23d1d442d1c1943d8245958e6fd0dbca11f3bd160e671d280` (24895 bytes, 674 lines), CI was green, the installed source matched that tree, and an isolated apply-check passed. This revision replaces that patch. Re-check the new `ARTIFACT.txt` hash. Do not deploy this revision on that confirmation.
 
-- Whether the tablet token's RBAC role, not only its `llm.invoke` scope, is granted for this user and team.
-- Whether the ContextForge process binds loopback only, behind Caddy.
-- How many worker processes serve the app. The in-flight and per-minute limits are per process.
+IT also confirmed the backend listens on `127.0.0.1:4449` and Caddy on port 4444 overwrites `X-Forwarded-For` before the proxy. Runtime packages: ContextForge 1.1.0, FastAPI 0.162.0, Starlette 1.10.0, Pydantic 2.14.2, httpx 0.28.1. The mock HTTP tests install those FastAPI, Starlette, Pydantic, and httpx versions. They do not boot ContextForge.
+
+Worker count is not verified. There is no explicit `--workers`. IT observed one spawn child plus a tracker. The in-flight cap (2) and the per-minute cap (30) are per process. They are not global across workers, and they reset when the process restarts. A second worker would double both caps.
+
+Still not measured here, and not assumed:
+
+- Whether this user's RBAC role grants `llm.invoke` for the relevant team. Key Keeper's scope list is metadata. RBAC review is separate.
+- Provider speech capability. No paid call was made.
+
+## Cancellation and billing
+
+`asyncio.wait_for` around `asyncio.to_thread` does not kill the worker thread and does not undo upstream work. The in-flight slot stays taken until that thread leaves the upstream call, closes the response, and returns. A cancelled waiter or a deadline does not let another request start that slot early. A late body is closed and discarded. If the provider already accepted the request, this process cannot cancel the provider's bill.
 
 ## Install (not approved)
 

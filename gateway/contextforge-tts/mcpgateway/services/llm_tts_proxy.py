@@ -284,15 +284,24 @@ def safe_urlopen(request, timeout=UPSTREAM_TIMEOUT_SECONDS):
     return build_safe_opener().open(request, timeout=timeout)
 
 
-def _read_bounded(response, limit: int, cancel: Optional[threading.Event], deadline_s: float) -> bytes:
-    started = time.monotonic()
+def _close_response(response) -> None:
+    close = getattr(response, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception:
+        pass
+
+
+def _read_bounded(response, limit: int, cancel: Optional[threading.Event], deadline: float) -> bytes:
     chunks = []
     total = 0
     try:
         while True:
             if cancel is not None and cancel.is_set():
                 raise SpeechDenied(499, "Client cancelled")
-            if time.monotonic() - started > deadline_s:
+            if time.monotonic() >= deadline:
                 raise SpeechDenied(504, "TTS deadline exceeded")
             read = getattr(response, "read", None)
             if read is None:
@@ -315,12 +324,7 @@ def _read_bounded(response, limit: int, cancel: Optional[threading.Event], deadl
             chunks.append(block)
         return b"".join(chunks)
     finally:
-        close = getattr(response, "close", None)
-        if close is not None:
-            try:
-                close()
-            except Exception:
-                pass
+        _close_response(response)
 
 
 class TtsProxy:
@@ -386,12 +390,20 @@ class TtsProxy:
         opener: Callable,
         cancel: Optional[threading.Event],
     ) -> UpstreamResult:
+        # One deadline for the socket call and the body read. Cancelling the
+        # awaiting task does not release the in-flight slot; that happens
+        # only in this finally, after the worker returns.
+        deadline = time.monotonic() + self._timeout
         if cancel is not None and cancel.is_set():
             raise SpeechDenied(499, "Client cancelled")
         self._acquire()
+        response = None
         try:
             if cancel is not None and cancel.is_set():
                 raise SpeechDenied(499, "Client cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SpeechDenied(504, "TTS deadline exceeded")
             headers = {
                 "Authorization": "Bearer " + api_key,
                 "Content-Type": "application/json; charset=utf-8",
@@ -405,16 +417,11 @@ class TtsProxy:
                 return opener(req, timeout=timeout)
 
             try:
-                response = _open(request, self._timeout)
+                response = _open(request, remaining)
             except SpeechDenied:
                 raise
             except HTTPError as exc:
-                closer = getattr(getattr(exc, "fp", None), "close", None)
-                if closer is not None:
-                    try:
-                        closer()
-                    except Exception:
-                        pass
+                _close_response(getattr(exc, "fp", None))
                 self._log("tts upstream HTTP %s bytes=0" % exc.code)
                 raise SpeechDenied(502, "Upstream speech request failed") from None
             except URLError:
@@ -423,11 +430,18 @@ class TtsProxy:
             except Exception:
                 self._log("tts upstream HTTP 0 bytes=0")
                 raise SpeechDenied(502, "Upstream speech request failed") from None
+            if (cancel is not None and cancel.is_set()) or time.monotonic() >= deadline:
+                _close_response(response)
+                response = None
+                if cancel is not None and cancel.is_set():
+                    raise SpeechDenied(499, "Client cancelled")
+                raise SpeechDenied(504, "TTS deadline exceeded")
             status = getattr(response, "status", None) or getattr(response, "code", 200)
             raw_type = ""
             if getattr(response, "headers", None) is not None:
                 raw_type = response.headers.get("Content-Type") or response.headers.get("content-type") or ""
-            payload = _read_bounded(response, MAX_RESPONSE_BYTES, cancel, self._timeout)
+            payload = _read_bounded(response, MAX_RESPONSE_BYTES, cancel, deadline)
+            response = None
             self._log("tts upstream HTTP %s bytes=%s" % (status, len(payload)))
             if status < 200 or status >= 300:
                 raise SpeechDenied(502, "Upstream speech request failed")
@@ -438,6 +452,8 @@ class TtsProxy:
                 raise SpeechDenied(502, "Upstream speech response was not audio/mpeg")
             return UpstreamResult(status=int(status), content_type=raw_type, body=payload)
         finally:
+            if response is not None:
+                _close_response(response)
             self._release()
 
     def _acquire(self) -> None:
@@ -449,3 +465,31 @@ class TtsProxy:
     def _release(self) -> None:
         with self._lock:
             self._slots += 1
+
+
+def mount_tts(app, prefix: str, logger) -> str:
+    """Mount POST /tts, or a 503 fallback. Never raises.
+
+    A failure to import the real router must not affect routes already
+    mounted on ``app`` (chat and models). The error log is the exception
+    type name only.
+    """
+    try:
+        from mcpgateway.routers.llm_tts_router import llm_tts_router
+
+        app.include_router(llm_tts_router, prefix=prefix, tags=["LLM TTS"])
+        logger.info("LLM TTS router included at prefix %s", prefix)
+        return "mounted"
+    except Exception as exc:
+        logger.error("LLM TTS router unavailable: %s", type(exc).__name__)
+        from fastapi import APIRouter
+        from fastapi import HTTPException
+
+        fallback = APIRouter()
+
+        @fallback.post("/tts")
+        async def _tts_unavailable():
+            raise HTTPException(status_code=503, detail="TTS unavailable")
+
+        app.include_router(fallback, prefix=prefix, tags=["LLM TTS"])
+        return "unavailable"
