@@ -80,6 +80,8 @@ jobs:
       - uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: "8.7"
+      - name: Unit tests
+        run: gradle :app:testDebugUnitTest --stacktrace
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace
       # Issue #3: the Mini-built APK crashed on launch with

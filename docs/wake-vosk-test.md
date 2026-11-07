@@ -79,9 +79,12 @@ A full voice turn from a WAV, with no microphone, logs `JarvisVoice`.
 `--ez direct true` transcribes the clip with the bundled Vosk model (no
 grammar) and posts that text to `/llm/v1`. Without the extra, the WAV is
 posted to the relay. A 401 or 403 on the direct path still falls back to
-the relay. An unsafe transcript (`unlock`, `disarm`, `open garage`,
-`lock.*`, `cover.garage*`, `alarm_control_panel.*`) logs
-`JarvisVoice: refused=safety` and is not sent.
+the relay. Debug builds log the transcript as `JarvisVoice: heard="..."`.
+Lock, garage, and alarm speech is refused locally before the relay or
+`/llm/v1`, including Vosk splits and mishears (`un lock`, `and lock`,
+`dis arm`, `the arm`). That logs `JarvisVoice: refused=safety` and is
+not sent. Tool calls for `lock.*`, `cover.garage*`, and
+`alarm_control_panel.*` are refused the same way.
 
 ```bash
 adb shell am broadcast -a net.npalakurla.jarvis.tablet.DEBUG_TURN_WAV \
