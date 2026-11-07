@@ -182,6 +182,10 @@ class RouterHttpTests(unittest.TestCase):
         cls.router_mod = importlib.util.module_from_spec(spec)
         sys.modules["mcpgateway.routers.llm_tts_router"] = cls.router_mod
         spec.loader.exec_module(cls.router_mod)
+        cls.default_proxy = cls.router_mod._proxy
+
+    def test_router_ships_with_the_noop_logger(self):
+        self.assertIs(self.default_proxy._log, self.proxy._noop_log)
 
     def setUp(self):
         STATE["scopes"] = ["llm.read", "llm.invoke"]

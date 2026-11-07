@@ -1,7 +1,7 @@
-version=1.1.0+tablet-tts.4
+version=1.1.0+tablet-tts.5
 contextforge=v1.1.0
 contextforge_commit=aee91ff6db63b6aafa77522684a9483c418bb2a3
 file=gateway/contextforge-tts/contextforge-1.1.0-tts.patch
-sha256=e57867a9a9e6be231b1e3efbfc0d6545fe0a4765fd90bc7d6568413fb58ed3d3
-bytes=26505
-lines=717
+sha256=1d00938123481dcb26a99df1eadf57a21b5de6a146762addc9baf52164ad1a10
+bytes=27669
+lines=746

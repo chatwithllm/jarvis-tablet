@@ -88,6 +88,45 @@ class TtsProxyTests(unittest.TestCase):
         )
         return result, seen
 
+    def test_production_logger_emits_nothing(self):
+        import logging
+
+        class Grab(logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.messages = []
+
+            def emit(self, record):
+                self.messages.append(record.getMessage())
+
+        handler = Grab()
+        root = logging.getLogger()
+        previous = root.level
+        root.addHandler(handler)
+        root.setLevel(logging.DEBUG)
+        audio = b"AUDIOCANARYBYTES"
+        try:
+            client = proxy.TtsProxy()
+            self.assertIs(client._log, proxy._noop_log)
+            provider = _provider()
+            provider["api_key"] = "KEYCANARY"
+            client.speak(
+                _access(),
+                provider,
+                "TEXTCANARY",
+                "en",
+                "leo",
+                opener=lambda request, timeout=None: _Response(body=audio),
+            )
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(previous)
+        blob = "\n".join(handler.messages)
+        self.assertNotIn("TEXTCANARY", blob)
+        self.assertNotIn("KEYCANARY", blob)
+        self.assertNotIn("AUDIOCANARYBYTES", blob)
+        self.assertNotIn("tts upstream", blob)
+
     def test_missing_token_denied_before_upstream(self):
         calls = []
 
@@ -200,6 +239,7 @@ class TtsProxyTests(unittest.TestCase):
         self.assertEqual(sent["language"], "en")
         self.assertEqual(sent["voice_id"], "leo")
         self.assertNotIn("with_timestamps", sent)
+        # This list is the injected test sink, not the production logger.
         self.assertEqual(logs, ["tts upstream HTTP 200 bytes=%s" % len(audio)])
         for line in logs:
             self.assertIsNotNone(_LOG_LINE.match(line))
@@ -570,6 +610,127 @@ class TtsProxyTests(unittest.TestCase):
         self.assertTrue(late.closed)
         self.assertNotIn("LATECANARY", caught.exception.detail)
 
+    def _socket_response(self, client_sock, server_sock):
+        fp = client_sock.makefile("rb")
+        closed = {"value": False}
+
+        class Response:
+            status = 200
+            headers = {"Content-Type": "audio/mpeg"}
+
+            def read(self, n=1):
+                return fp.read(n)
+
+            def close(self):
+                closed["value"] = True
+                try:
+                    fp.close()
+                except Exception:
+                    pass
+                for sock in (client_sock, server_sock):
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+
+        response = Response()
+        response.fp = fp
+        return response, closed
+
+    def test_slow_trickle_stays_inside_the_deadline(self):
+        import socket
+        import time
+
+        client_sock, server_sock = socket.socketpair()
+        client_sock.settimeout(30)
+        response, closed = self._socket_response(client_sock, server_sock)
+
+        def trickle():
+            try:
+                for _ in range(40):
+                    server_sock.send(b"\xff")
+                    time.sleep(0.05)
+                server_sock.shutdown(socket.SHUT_WR)
+            except Exception:
+                return
+
+        threading.Thread(target=trickle, daemon=True).start()
+        client = proxy.TtsProxy(timeout=1.0, max_per_minute=100)
+        started = time.monotonic()
+        with self.assertRaises(proxy.SpeechDenied) as caught:
+            client.speak(_access(), _provider(), "TRICKLE_CANARY", "en", "leo", opener=lambda request, timeout=None: response)
+        elapsed = time.monotonic() - started
+        self.assertEqual(caught.exception.status, 504)
+        self.assertLess(elapsed, 1.5)
+        self.assertTrue(closed["value"])
+        self.assertEqual(client._slots, 2)
+        self.assertNotIn("TRICKLE_CANARY", caught.exception.detail)
+        self.assertNotIn("xff", caught.exception.detail.lower())
+
+    def test_blocked_read_times_out_with_the_deadline_and_releases_the_slot(self):
+        import socket
+        import time
+
+        client_sock, server_sock = socket.socketpair()
+        client_sock.settimeout(5)
+        response, closed = self._socket_response(client_sock, server_sock)
+        started_read = threading.Event()
+        original = response.read
+
+        def read(n=1):
+            started_read.set()
+            return original(n)
+
+        response.read = read
+        client = proxy.TtsProxy(timeout=0.4, max_in_flight=1, max_per_minute=100)
+        holder = {}
+
+        def run():
+            try:
+                client.speak(
+                    _access(),
+                    _provider(),
+                    "BLOCK_CANARY",
+                    "en",
+                    "leo",
+                    opener=lambda request, timeout=None: response,
+                )
+            except proxy.SpeechDenied as exc:
+                holder["exc"] = exc
+
+        started = time.monotonic()
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.assertTrue(started_read.wait(1))
+        calls = []
+        with self.assertRaises(proxy.SpeechBusy):
+            client.speak(
+                _access(),
+                _provider(),
+                "Other",
+                "en",
+                "leo",
+                opener=lambda request, timeout=None: calls.append(1),
+            )
+        self.assertEqual(calls, [])
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(holder["exc"].status, 504)
+        self.assertTrue(closed["value"])
+        self.assertEqual(client._slots, 1)
+        self.assertNotIn("BLOCK_CANARY", holder["exc"].detail)
+        follow = client.speak(
+            _access(),
+            _provider(),
+            "Hi",
+            "en",
+            "leo",
+            opener=lambda request, timeout=None: _Response(),
+        )
+        self.assertEqual(follow.status, 200)
+
     def test_oversized_upstream_body_is_closed_and_not_returned(self):
         class Big:
             def __init__(self):
@@ -579,11 +740,12 @@ class TtsProxyTests(unittest.TestCase):
             status = 200
             headers = {"Content-Type": "audio/mpeg"}
 
-            def read(self, n=65536):
+            def read(self, n=1):
                 if self.sent > proxy.MAX_RESPONSE_BYTES:
                     return b""
-                self.sent += n
-                return b"z" * n
+                chunk = 65536
+                self.sent += chunk
+                return b"z" * chunk
 
             def close(self):
                 self.closed = True
@@ -657,7 +819,7 @@ class PatchRegressionTests(unittest.TestCase):
         self.assertEqual(recorded["sha256"], hashlib.sha256(raw).hexdigest())
         self.assertEqual(int(recorded["bytes"]), len(raw))
         self.assertEqual(int(recorded["lines"]), raw.count(b"\n"))
-        self.assertEqual(recorded["version"], "1.1.0+tablet-tts.4")
+        self.assertEqual(recorded["version"], "1.1.0+tablet-tts.5")
 
 
 if __name__ == "__main__":

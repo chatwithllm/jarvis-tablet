@@ -1,6 +1,6 @@
 # TTS route checklist for IT Admin
 
-Artifact: `contextforge-1.1.0-tts.patch` (version `1.1.0+tablet-tts.4`). The sha256, byte count, and line count are in `ARTIFACT.txt` next to the patch. Recompute them before review; do not trust a copied hash from chat.
+Artifact: `contextforge-1.1.0-tts.patch` (version `1.1.0+tablet-tts.5`). The sha256, byte count, and line count are in `ARTIFACT.txt` next to the patch. Recompute them before review; do not trust a copied hash from chat.
 
 This is a review package. Deploy, restart, permission changes, Caddy edits, and any call to xAI are not approved.
 
@@ -37,11 +37,11 @@ The tablet sends `Authorization: Bearer` with `cf-jarvis-tablet-llm`. `get_curre
 
 The upstream bearer is not the tablet token. No client header is copied. The handler loads `llm_providers.id = 78770f3fb044491fa06bfcc0d4b19825` and calls `decode_auth(row.api_key)`, which decrypts the ciphertext already stored on that row (`encode_auth({"api_key": ...})` in `mcpgateway/utils/services_auth.py`, secret `AUTH_ENCRYPTION_SECRET` on the gateway). `decoded["api_key"]` is the only upstream `Authorization` value. The stored `api_base` must be exactly `https://api.x.ai/v1`, and `provider_type` must be `openai_compatible`. Anything else is 503 before a connection.
 
-Logs from this route are status and byte counts only (`tts upstream HTTP <status> bytes=<n>`). Do not treat an older "logging is off" note as evidence. The mock tests assert the log lines even when the logger is recording.
+The production logger on this route is a no-op. `TtsProxy()` is constructed with `_noop_log`, and the router does not pass another logger. No request text, audio, provider key, or status line is emitted. An injected test sink can record `tts upstream HTTP <status> bytes=<n>` and nothing else; that sink is not installed on the gateway. Do not add a logger to make the status line appear.
 
 ## Trust boundary
 
-Do not change Caddy. On this gateway, Caddy on port 4444 replaces a client-supplied `X-Forwarded-For` with the TCP peer. The backend is expected to be reachable only from that proxy, on loopback. Those two facts are the IP boundary. IT has not yet confirmed loopback binding or worker count for this process; do not treat them as already verified.
+Do not change Caddy. On this gateway, Caddy on port 4444 replaces a client-supplied `X-Forwarded-For` with the TCP peer, and the backend listens on `127.0.0.1:4449`. Those two facts are the IP boundary. One serving process was evidenced. The configured maximum worker count was not verified.
 
 ContextForge `v1.1.0` registers `ProxyHeadersMiddleware` with `trusted_hosts="*"` (`mcpgateway/main.py`). That middleware can rewrite `request.client.host` from `X-Forwarded-For` before this handler runs. A unit test that compares the header to `request.client.host` does not see the original TCP peer after that rewrite. This route therefore does not claim the header check is the pin. It applies the token's existing `scopes.ip_restrictions` to whatever peer the process sees, the same input `TokenScopingMiddleware._get_client_ip` uses. The household token is already pinned to `192.168.20.109/32`. This patch does not add a second hardcoded address and does not grant a wider pin.
 
@@ -70,16 +70,15 @@ IT confirmed the published patch at `7a463af` matched sha256 `a88ff204999cdcb23d
 
 IT also confirmed the backend listens on `127.0.0.1:4449` and Caddy on port 4444 overwrites `X-Forwarded-For` before the proxy. Runtime packages: ContextForge 1.1.0, FastAPI 0.162.0, Starlette 1.10.0, Pydantic 2.14.2, httpx 0.28.1. The mock HTTP tests install those FastAPI, Starlette, Pydantic, and httpx versions. They do not boot ContextForge.
 
-Worker count is not verified. There is no explicit `--workers`. IT observed one spawn child plus a tracker. The in-flight cap (2) and the per-minute cap (30) are per process. They are not global across workers, and they reset when the process restarts. A second worker would double both caps.
+One serving process was evidenced. There is no confirmed `--workers` value, and the configured maximum is unknown. The in-flight cap (2) and the per-minute cap (30) are per process. They are not global across workers, and they reset when the process restarts. A second worker would double both caps.
 
-Still not measured here, and not assumed:
-
-- Whether this user's RBAC role grants `llm.invoke` for the relevant team. Key Keeper's scope list is metadata. RBAC review is separate.
-- Provider speech capability. No paid call was made.
+Key Keeper confirmed the active RBAC role is global `platform_admin` with permissions `*`, which grants `llm.invoke`. The token's team is null. Its scopes and `192.168.20.109/32` pin are unchanged. That is still not proof that this provider may call speech. Provider-console approval is pending. No paid call was made.
 
 ## Cancellation and billing
 
-`asyncio.wait_for` around `asyncio.to_thread` does not kill the worker thread and does not undo upstream work. The in-flight slot stays taken until that thread leaves the upstream call, closes the response, and returns. A cancelled waiter or a deadline does not let another request start that slot early. A late body is closed and discarded. If the provider already accepted the request, this process cannot cancel the provider's bill.
+`asyncio.wait_for` around `asyncio.to_thread` does not kill the worker thread and does not undo upstream work. The router's 35 second wait is only a backstop for the awaiting task. The worker's own deadline (30 seconds unless constructed with another timeout) bounds the socket.
+
+The body is read one byte at a time, and the socket timeout is set to the time remaining before each read. A peer that trickles a byte every few tens of milliseconds cannot sit inside `read(65536)` until the buffer fills. A peer that sends nothing returns when that socket timeout fires. The slot stays taken until the read returns, the response is closed, and the thread exits. A late body is discarded. Closing the socket does not cancel a provider bill, and this process cannot force the thread to die any sooner than the socket call returns.
 
 ## Install (not approved)
 

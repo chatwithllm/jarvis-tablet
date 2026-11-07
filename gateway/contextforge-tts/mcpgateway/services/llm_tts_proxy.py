@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import socket
 import threading
 import time
 import urllib.request
@@ -20,7 +21,7 @@ from typing import Callable, Mapping, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
-PATCH_VERSION = "1.1.0+tablet-tts.3"
+PATCH_VERSION = "1.1.0+tablet-tts.5"
 FIXED_PROVIDER_ID = "78770f3fb044491fa06bfcc0d4b19825"
 REQUIRED_PROVIDER_TYPE = "openai_compatible"
 REQUIRED_API_BASE = "https://api.x.ai/v1"
@@ -294,6 +295,39 @@ def _close_response(response) -> None:
         pass
 
 
+def _arm_read_timeout(response, remaining: float) -> None:
+    """Bound the next recv by the time left on the worker deadline.
+
+    urlopen's timeout is per recv. A peer that keeps sending refreshes it,
+    so a later read(65536) can run long past the deadline. Setting the
+    socket timeout here makes a silent peer return when the deadline hits.
+    There is no socket on the in-memory test doubles.
+    """
+    fp = getattr(response, "fp", None)
+    raw = getattr(fp, "raw", None)
+    sock = getattr(raw, "_sock", None)
+    if sock is None or not hasattr(sock, "settimeout"):
+        return
+    sock.settimeout(remaining if remaining > 0 else 0.001)
+
+
+def _pull_some(response):
+    """One framed body slice that returns as soon as any bytes are available.
+
+    HTTPResponse.read(n) waits until n bytes or EOF, and each recv refreshes
+    the socket timeout. read(1) returns on the first byte so the deadline is
+    checked between bytes. The second value is true when the double has no
+    size argument and this call already returned the whole body.
+    """
+    read = getattr(response, "read", None)
+    if read is None:
+        return None, True
+    try:
+        return read(1), False
+    except TypeError:
+        return read(), True
+
+
 def _read_bounded(response, limit: int, cancel: Optional[threading.Event], deadline: float) -> bytes:
     chunks = []
     total = 0
@@ -301,27 +335,22 @@ def _read_bounded(response, limit: int, cancel: Optional[threading.Event], deadl
         while True:
             if cancel is not None and cancel.is_set():
                 raise SpeechDenied(499, "Client cancelled")
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise SpeechDenied(504, "TTS deadline exceeded")
-            read = getattr(response, "read", None)
-            if read is None:
-                break
+            _arm_read_timeout(response, remaining)
             try:
-                block = read(65536)
-            except TypeError:
-                block = read()
-                if block:
-                    total = len(block)
-                    if total > limit:
-                        raise SpeechDenied(502, "Upstream speech response is too large")
-                    chunks.append(block)
-                break
-            if not block:
+                block, whole = _pull_some(response)
+            except (socket.timeout, TimeoutError):
+                raise SpeechDenied(504, "TTS deadline exceeded") from None
+            if block is None or block == b"":
                 break
             total += len(block)
             if total > limit:
                 raise SpeechDenied(502, "Upstream speech response is too large")
             chunks.append(block)
+            if whole:
+                break
         return b"".join(chunks)
     finally:
         _close_response(response)
