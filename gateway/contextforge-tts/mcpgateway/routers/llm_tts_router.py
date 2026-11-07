@@ -9,10 +9,13 @@ not read Caddy config and does not grant permissions.
 
 from __future__ import annotations
 
+import asyncio
+import json
+
 # Third-Party
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -99,28 +102,44 @@ def _provider_view(db: Session) -> dict | None:
     }
 
 
+_BODY_KEYS = frozenset({"text", "language", "voice_id", "speed", "output_format", "with_timestamps"})
+
+
+def _parse_body(raw: bytes) -> TtsBody:
+    """Validate JSON without echoing the caller's text back in the error."""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid TTS request") from None
+    if not isinstance(data, dict) or not set(data).issubset(_BODY_KEYS):
+        raise HTTPException(status_code=422, detail="Invalid TTS request")
+    try:
+        return TtsBody.model_validate(data)
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="Invalid TTS request") from None
+
+
 # Public route: POST /tts  (full path is {LLM_API_PREFIX}/tts, household /llm/v1/tts).
 @llm_tts_router.post("/tts", summary="Tablet text to speech")
 @require_permission("llm.invoke", allow_admin_bypass=False)
 async def text_to_speech(
     request: Request,
-    body: TtsBody,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user_with_permissions),
 ):
-    """Speak one reply. Auth and the IP pin run before the upstream call.
+    """Speak one reply. Auth and the token IP pin run before the upstream call.
+
+    The inbound Authorization header is the tablet token. It is required
+    and is not an override. It is not copied upstream.
 
     Credentials: llm_providers.id 78770f3fb044491fa06bfcc0d4b19825, then
-    decode_auth(row.api_key)["api_key"]. The inbound Authorization header
-    is the tablet token and is not copied upstream.
+    decode_auth(row.api_key)["api_key"].
     """
     if current_user is None or "email" not in current_user:
         raise HTTPException(status_code=401, detail="Authorization token required")
-    override = tuple(
-        key
-        for key in FORBIDDEN_OVERRIDE_KEYS
-        if key in request.query_params or key.lower() in {name.lower() for name in request.headers.keys()}
-    )
+    # Query keys only. Do not treat the Authorization header as an override.
+    override = tuple(key for key in FORBIDDEN_OVERRIDE_KEYS if key in request.query_params)
+    body = _parse_body(await request.body())
     try:
         restrictions = await _ip_restrictions(request)
         access = AccessRequest(
@@ -134,16 +153,22 @@ async def text_to_speech(
         )
         if await request.is_disconnected():
             raise SpeechDenied(499, "Client cancelled")
-        result = _proxy.speak(
-            access,
-            _provider_view(db),
-            body.text,
-            body.language,
-            body.voice_id,
-            body.speed,
-            body.output_format,
-            body.with_timestamps,
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                _proxy.speak,
+                access,
+                _provider_view(db),
+                body.text,
+                body.language,
+                body.voice_id,
+                body.speed,
+                body.output_format,
+                body.with_timestamps,
+            ),
+            timeout=35,
         )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="TTS deadline exceeded") from None
     except SpeechDenied as exc:
         raise _denied(exc) from None
     return Response(content=result.body, media_type=result.content_type, status_code=result.status)

@@ -1,6 +1,6 @@
 # TTS route checklist for IT Admin
 
-Artifact: `contextforge-1.1.0-tts.patch` (version `1.1.0+tablet-tts.2`).
+Artifact: `contextforge-1.1.0-tts.patch` (version `1.1.0+tablet-tts.3`). The sha256, byte count, and line count are in `ARTIFACT.txt` next to the patch. Recompute them before review; do not trust a copied hash from chat.
 
 This is a review package. Deploy, restart, permission changes, Caddy edits, and any call to xAI are not approved.
 
@@ -29,7 +29,7 @@ Read-only metadata, reviewed as labels only. It does not show that `POST /llm/v1
 - That token's IP pin is still `192.168.20.109/32`.
 - Enabled provider `xai-tablet`, id `78770f3fb044491fa06bfcc0d4b19825`, type `openai_compatible`, `api_base` `https://api.x.ai/v1`.
 
-The handler hard-binds that id, that type, and that exact base. A client `model`, `provider`, `api_base`, `api_key`, `Authorization`, or `X-Api-Key` does not select a provider. `voice_id` must be one of the stock allowlist (`leo`, `altair`, `lux`, `eve`, `rex`, `sal`, `ara`, `rigel`). A value with `/` or `:` is rejected. The operation map adds `llm.invoke` for `POST /llm/v1/tts` only. `POST /llm/v1/stt`, `GET /llm/v1/tts/voices`, and every other unmapped path stay on the existing default deny.
+The handler hard-binds that id, that type, and that exact base. A client `model`, `provider`, `api_base`, or `api_key` in the query string or JSON body does not select a provider. The inbound `Authorization` header is the tablet token: it is required, and it is not an override. It is never copied upstream. `voice_id` must be one of the stock allowlist (`leo`, `altair`, `lux`, `eve`, `rex`, `sal`, `ara`, `rigel`). A value with `/` or `:` is rejected. The operation map adds `llm.invoke` for `POST /llm/v1/tts` only. `POST /llm/v1/stt`, `GET /llm/v1/tts/voices`, and every other unmapped path stay on the existing default deny.
 
 ## How the stored xAI key is used
 
@@ -39,11 +39,13 @@ The upstream bearer is not the tablet token. No client header is copied. The han
 
 Logs from this route are status and byte counts only (`tts upstream HTTP <status> bytes=<n>`). Do not treat an older "logging is off" note as evidence. The mock tests assert the log lines even when the logger is recording.
 
-## IP pin and Caddy
+## Trust boundary
 
-Do not change the Caddy listener on port 4444. It replaces a client `X-Forwarded-For` with the TCP peer and stays the edge.
+Do not change Caddy. On this gateway, Caddy on port 4444 replaces a client-supplied `X-Forwarded-For` with the TCP peer. The backend is expected to be reachable only from that proxy, on loopback. Those two facts are the IP boundary. IT has not yet confirmed loopback binding or worker count for this process; do not treat them as already verified.
 
-The speech handler does not treat `X-Forwarded-For` or `X-Real-IP` as the client. It uses `request.client.host`, the same peer `TokenScopingMiddleware._get_client_ip` uses. A header whose first address is not that peer is 403 before any upstream call. The token's `scopes.ip_restrictions` must be non-empty and must contain the peer. The tablet token's pin is `192.168.20.109/32`. An empty restriction list does not mean allow-all on this route.
+ContextForge `v1.1.0` registers `ProxyHeadersMiddleware` with `trusted_hosts="*"` (`mcpgateway/main.py`). That middleware can rewrite `request.client.host` from `X-Forwarded-For` before this handler runs. A unit test that compares the header to `request.client.host` does not see the original TCP peer after that rewrite. This route therefore does not claim the header check is the pin. It applies the token's existing `scopes.ip_restrictions` to whatever peer the process sees, the same input `TokenScopingMiddleware._get_client_ip` uses. The household token is already pinned to `192.168.20.109/32`. This patch does not add a second hardcoded address and does not grant a wider pin.
+
+An empty restriction list is still denied on this route. A forwarded header that names a different address than the peer the handler actually sees is denied, which only helps when the header and the peer disagree. After `trusted_hosts="*"`, they often agree because the peer was rewritten. Caddy's overwrite plus a loopback-only backend are what stop a direct client from supplying that header.
 
 ## Tablet v8 compatibility
 
@@ -57,9 +59,18 @@ Gaps, not fixed here:
 
 ## Backup
 
+This patch does not change the database, the schema, or the provider row. Do not take a database snapshot and do not copy a database dump. A dump would contain the provider ciphertext.
+
 1. Record the image id or the supervisor unit, and the git revision if the tree is a checkout.
-2. Copy `mcpgateway/main.py` and `mcpgateway/middleware/token_scoping.py` to a directory outside the app tree.
-3. Snapshot the database. This patch does not migrate it. The snapshot is so a bad restart can be reasoned about. Do not edit the `llm_providers` row.
+2. Copy `mcpgateway/main.py` and `mcpgateway/middleware/token_scoping.py` to a directory outside the app tree. Those two files, plus deletion of the two new modules, are the rollback set.
+
+## Runtime facts still pending IT
+
+These are not asserted by this artifact, because they were not measured here:
+
+- Whether the tablet token's RBAC role, not only its `llm.invoke` scope, is granted for this user and team.
+- Whether the ContextForge process binds loopback only, behind Caddy.
+- How many worker processes serve the app. The in-flight and per-minute limits are per process.
 
 ## Install (not approved)
 
@@ -111,5 +122,5 @@ Chat and models stay on their old permissions. A `llm.invoke`-only token may sti
 
 1. Restore the two backed-up files and delete the two new modules.
 2. Restart the same way as the install.
-3. `POST /llm/v1/tts` should fail closed again (403 from the scope map, or 404 if the map line was removed too). `POST /llm/v1/chat/completions` should behave as it did before.
-4. No database rollback. The provider row is unchanged.
+3. `POST /llm/v1/tts` should fail closed again (403 from the scope map once that line is gone, or 404 if the router is gone and the map line is gone too). `POST /llm/v1/chat/completions` should behave as it did before.
+4. There is no database rollback. Nothing in the database was changed.

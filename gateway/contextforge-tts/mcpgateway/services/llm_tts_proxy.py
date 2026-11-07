@@ -14,12 +14,13 @@ import ipaddress
 import json
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Mapping, Optional
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
-PATCH_VERSION = "1.1.0+tablet-tts.2"
+PATCH_VERSION = "1.1.0+tablet-tts.3"
 FIXED_PROVIDER_ID = "78770f3fb044491fa06bfcc0d4b19825"
 REQUIRED_PROVIDER_TYPE = "openai_compatible"
 REQUIRED_API_BASE = "https://api.x.ai/v1"
@@ -28,6 +29,7 @@ TABLET_CIDR = "192.168.20.109/32"
 REQUIRED_PERMISSION = "llm.invoke"
 
 MAX_TTS_CHARS = 4_000
+MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 MAX_IN_FLIGHT = 2
 MAX_PER_MINUTE = 30
 UPSTREAM_TIMEOUT_SECONDS = 30.0
@@ -107,10 +109,11 @@ def authorize(access: AccessRequest) -> None:
         raise SpeechDenied(403, "Forwarded IP header does not match the connection")
     if not access.ip_restrictions:
         raise SpeechDenied(403, "Token is not IP-pinned")
+    # The allow set is the token's existing ip_restrictions. This route
+    # does not add a second hardcoded address. The household token is
+    # already pinned to TABLET_CIDR; that fact is metadata, not a new grant.
     if not _ip_allowed(access.socket_ip, access.ip_restrictions):
         raise SpeechDenied(403, "Connection IP is not allowed by the token pin")
-    if not _ip_allowed(access.socket_ip, (TABLET_CIDR,)):
-        raise SpeechDenied(403, "Connection IP is not the tablet")
 
 
 def _scope_allows(permissions: tuple) -> bool:
@@ -242,6 +245,84 @@ def build_tts_payload(
     return payload
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Do not follow upstream redirects. A 3xx must not resend the provider key."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise SpeechDenied(502, "Upstream redirect refused")
+
+
+class _NoEnvProxy(urllib.request.ProxyHandler):
+    """Replace the default ProxyHandler so HTTPS_PROXY is not inherited.
+
+    Subclassing ProxyHandler suppresses urllib's env-based handler.
+    The open methods return None so the normal HTTP handler connects
+    directly. An empty ProxyHandler() would be dropped and the default
+    would come back.
+    """
+
+    def __init__(self):
+        urllib.request.BaseHandler.__init__(self)
+        self.proxies = {}
+
+    def http_open(self, req):
+        return None
+
+    def https_open(self, req):
+        return None
+
+
+def build_safe_opener():
+    """Opener with no environment proxy and no redirect following."""
+    return urllib.request.build_opener(
+        _NoEnvProxy(),
+        _RefuseRedirect(),
+    )
+
+
+def safe_urlopen(request, timeout=UPSTREAM_TIMEOUT_SECONDS):
+    return build_safe_opener().open(request, timeout=timeout)
+
+
+def _read_bounded(response, limit: int, cancel: Optional[threading.Event], deadline_s: float) -> bytes:
+    started = time.monotonic()
+    chunks = []
+    total = 0
+    try:
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise SpeechDenied(499, "Client cancelled")
+            if time.monotonic() - started > deadline_s:
+                raise SpeechDenied(504, "TTS deadline exceeded")
+            read = getattr(response, "read", None)
+            if read is None:
+                break
+            try:
+                block = read(65536)
+            except TypeError:
+                block = read()
+                if block:
+                    total = len(block)
+                    if total > limit:
+                        raise SpeechDenied(502, "Upstream speech response is too large")
+                    chunks.append(block)
+                break
+            if not block:
+                break
+            total += len(block)
+            if total > limit:
+                raise SpeechDenied(502, "Upstream speech response is too large")
+            chunks.append(block)
+        return b"".join(chunks)
+    finally:
+        close = getattr(response, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass
+
+
 class TtsProxy:
     def __init__(
         self,
@@ -250,12 +331,14 @@ class TtsProxy:
         timeout: float = UPSTREAM_TIMEOUT_SECONDS,
         log: LogFn = _noop_log,
         clock: Callable[[], float] = time.monotonic,
+        opener: Optional[Callable] = None,
     ):
         self._slots = max_in_flight
         self._max_per_minute = max_per_minute
         self._timeout = timeout
         self._log = log
         self._clock = clock
+        self._opener = opener
         self._recent: list = []
         self._lock = threading.Lock()
 
@@ -269,7 +352,7 @@ class TtsProxy:
         speed: float = 1.08,
         output_format: Optional[Mapping] = None,
         with_timestamps: Optional[bool] = None,
-        opener: Callable = urlopen,
+        opener: Optional[Callable] = None,
         cancel: Optional[threading.Event] = None,
     ) -> UpstreamResult:
         authorize(access)
@@ -286,7 +369,7 @@ class TtsProxy:
         )
         body = json.dumps(payload).encode("utf-8")
         self._charge_rate()
-        return self._send(key, body, opener, cancel)
+        return self._send(key, body, opener or self._opener or safe_urlopen, cancel)
 
     def _charge_rate(self) -> None:
         now = self._clock()
@@ -326,6 +409,12 @@ class TtsProxy:
             except SpeechDenied:
                 raise
             except HTTPError as exc:
+                closer = getattr(getattr(exc, "fp", None), "close", None)
+                if closer is not None:
+                    try:
+                        closer()
+                    except Exception:
+                        pass
                 self._log("tts upstream HTTP %s bytes=0" % exc.code)
                 raise SpeechDenied(502, "Upstream speech request failed") from None
             except URLError:
@@ -338,9 +427,7 @@ class TtsProxy:
             raw_type = ""
             if getattr(response, "headers", None) is not None:
                 raw_type = response.headers.get("Content-Type") or response.headers.get("content-type") or ""
-            payload = response.read() if hasattr(response, "read") else b""
-            if cancel is not None and cancel.is_set():
-                raise SpeechDenied(499, "Client cancelled")
+            payload = _read_bounded(response, MAX_RESPONSE_BYTES, cancel, self._timeout)
             self._log("tts upstream HTTP %s bytes=%s" % (status, len(payload)))
             if status < 200 or status >= 300:
                 raise SpeechDenied(502, "Upstream speech request failed")

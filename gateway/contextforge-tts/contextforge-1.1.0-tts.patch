@@ -1,8 +1,8 @@
 diff --git a/mcpgateway/main.py b/mcpgateway/main.py
-index a3b5759..affd19c 100644
+index a3b5759..b9fd42c 100644
 --- a/mcpgateway/main.py
 +++ b/mcpgateway/main.py
-@@ -12996,6 +12996,15 @@ if settings.llmchat_enabled:
+@@ -12996,6 +12996,22 @@ if settings.llmchat_enabled:
      except ImportError as e:
          logger.debug(f"LLM proxy router not available: {e}")
  
@@ -12,8 +12,15 @@ index a3b5759..affd19c 100644
 +
 +        app.include_router(llm_tts_router, prefix=settings.llm_api_prefix, tags=["LLM TTS"])
 +        logger.info(f"LLM TTS router included at prefix {settings.llm_api_prefix}")
-+    except ImportError as e:
-+        logger.error(f"LLM TTS router not available: {e}")
++    except Exception as exc:
++        logger.error("LLM TTS router unavailable: %s", type(exc).__name__)
++        _tts_fallback = APIRouter()
++
++        @_tts_fallback.post("/tts")
++        async def _tts_unavailable():
++            raise HTTPException(status_code=503, detail="TTS unavailable")
++
++        app.include_router(_tts_fallback, prefix=settings.llm_api_prefix, tags=["LLM TTS"])
 +
  # Feature flags for admin UI (logged for visibility; admin router is inside v1_router)
  UI_ENABLED = settings.mcpgateway_ui_enabled
@@ -34,7 +41,7 @@ diff --git a/mcpgateway/services/llm_tts_proxy.py b/mcpgateway/services/llm_tts_
 new file mode 100644
 --- /dev/null
 +++ b/mcpgateway/services/llm_tts_proxy.py
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,451 @@
 +"""POST /tts proxy core for ContextForge 1.1.0.
 +
 +No ContextForge import. The router mounts this on the gateway. Tests
@@ -51,12 +58,13 @@ new file mode 100644
 +import json
 +import threading
 +import time
++import urllib.request
 +from dataclasses import dataclass
 +from typing import Callable, Mapping, Optional
 +from urllib.error import HTTPError, URLError
-+from urllib.request import Request, urlopen
++from urllib.request import Request
 +
-+PATCH_VERSION = "1.1.0+tablet-tts.2"
++PATCH_VERSION = "1.1.0+tablet-tts.3"
 +FIXED_PROVIDER_ID = "78770f3fb044491fa06bfcc0d4b19825"
 +REQUIRED_PROVIDER_TYPE = "openai_compatible"
 +REQUIRED_API_BASE = "https://api.x.ai/v1"
@@ -65,6 +73,7 @@ new file mode 100644
 +REQUIRED_PERMISSION = "llm.invoke"
 +
 +MAX_TTS_CHARS = 4_000
++MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 +MAX_IN_FLIGHT = 2
 +MAX_PER_MINUTE = 30
 +UPSTREAM_TIMEOUT_SECONDS = 30.0
@@ -144,10 +153,11 @@ new file mode 100644
 +        raise SpeechDenied(403, "Forwarded IP header does not match the connection")
 +    if not access.ip_restrictions:
 +        raise SpeechDenied(403, "Token is not IP-pinned")
++    # The allow set is the token's existing ip_restrictions. This route
++    # does not add a second hardcoded address. The household token is
++    # already pinned to TABLET_CIDR; that fact is metadata, not a new grant.
 +    if not _ip_allowed(access.socket_ip, access.ip_restrictions):
 +        raise SpeechDenied(403, "Connection IP is not allowed by the token pin")
-+    if not _ip_allowed(access.socket_ip, (TABLET_CIDR,)):
-+        raise SpeechDenied(403, "Connection IP is not the tablet")
 +
 +
 +def _scope_allows(permissions: tuple) -> bool:
@@ -279,6 +289,84 @@ new file mode 100644
 +    return payload
 +
 +
++class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
++    """Do not follow upstream redirects. A 3xx must not resend the provider key."""
++
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        raise SpeechDenied(502, "Upstream redirect refused")
++
++
++class _NoEnvProxy(urllib.request.ProxyHandler):
++    """Replace the default ProxyHandler so HTTPS_PROXY is not inherited.
++
++    Subclassing ProxyHandler suppresses urllib's env-based handler.
++    The open methods return None so the normal HTTP handler connects
++    directly. An empty ProxyHandler() would be dropped and the default
++    would come back.
++    """
++
++    def __init__(self):
++        urllib.request.BaseHandler.__init__(self)
++        self.proxies = {}
++
++    def http_open(self, req):
++        return None
++
++    def https_open(self, req):
++        return None
++
++
++def build_safe_opener():
++    """Opener with no environment proxy and no redirect following."""
++    return urllib.request.build_opener(
++        _NoEnvProxy(),
++        _RefuseRedirect(),
++    )
++
++
++def safe_urlopen(request, timeout=UPSTREAM_TIMEOUT_SECONDS):
++    return build_safe_opener().open(request, timeout=timeout)
++
++
++def _read_bounded(response, limit: int, cancel: Optional[threading.Event], deadline_s: float) -> bytes:
++    started = time.monotonic()
++    chunks = []
++    total = 0
++    try:
++        while True:
++            if cancel is not None and cancel.is_set():
++                raise SpeechDenied(499, "Client cancelled")
++            if time.monotonic() - started > deadline_s:
++                raise SpeechDenied(504, "TTS deadline exceeded")
++            read = getattr(response, "read", None)
++            if read is None:
++                break
++            try:
++                block = read(65536)
++            except TypeError:
++                block = read()
++                if block:
++                    total = len(block)
++                    if total > limit:
++                        raise SpeechDenied(502, "Upstream speech response is too large")
++                    chunks.append(block)
++                break
++            if not block:
++                break
++            total += len(block)
++            if total > limit:
++                raise SpeechDenied(502, "Upstream speech response is too large")
++            chunks.append(block)
++        return b"".join(chunks)
++    finally:
++        close = getattr(response, "close", None)
++        if close is not None:
++            try:
++                close()
++            except Exception:
++                pass
++
++
 +class TtsProxy:
 +    def __init__(
 +        self,
@@ -287,12 +375,14 @@ new file mode 100644
 +        timeout: float = UPSTREAM_TIMEOUT_SECONDS,
 +        log: LogFn = _noop_log,
 +        clock: Callable[[], float] = time.monotonic,
++        opener: Optional[Callable] = None,
 +    ):
 +        self._slots = max_in_flight
 +        self._max_per_minute = max_per_minute
 +        self._timeout = timeout
 +        self._log = log
 +        self._clock = clock
++        self._opener = opener
 +        self._recent: list = []
 +        self._lock = threading.Lock()
 +
@@ -306,7 +396,7 @@ new file mode 100644
 +        speed: float = 1.08,
 +        output_format: Optional[Mapping] = None,
 +        with_timestamps: Optional[bool] = None,
-+        opener: Callable = urlopen,
++        opener: Optional[Callable] = None,
 +        cancel: Optional[threading.Event] = None,
 +    ) -> UpstreamResult:
 +        authorize(access)
@@ -323,7 +413,7 @@ new file mode 100644
 +        )
 +        body = json.dumps(payload).encode("utf-8")
 +        self._charge_rate()
-+        return self._send(key, body, opener, cancel)
++        return self._send(key, body, opener or self._opener or safe_urlopen, cancel)
 +
 +    def _charge_rate(self) -> None:
 +        now = self._clock()
@@ -363,6 +453,12 @@ new file mode 100644
 +            except SpeechDenied:
 +                raise
 +            except HTTPError as exc:
++                closer = getattr(getattr(exc, "fp", None), "close", None)
++                if closer is not None:
++                    try:
++                        closer()
++                    except Exception:
++                        pass
 +                self._log("tts upstream HTTP %s bytes=0" % exc.code)
 +                raise SpeechDenied(502, "Upstream speech request failed") from None
 +            except URLError:
@@ -375,9 +471,7 @@ new file mode 100644
 +            raw_type = ""
 +            if getattr(response, "headers", None) is not None:
 +                raw_type = response.headers.get("Content-Type") or response.headers.get("content-type") or ""
-+            payload = response.read() if hasattr(response, "read") else b""
-+            if cancel is not None and cancel.is_set():
-+                raise SpeechDenied(499, "Client cancelled")
++            payload = _read_bounded(response, MAX_RESPONSE_BYTES, cancel, self._timeout)
 +            self._log("tts upstream HTTP %s bytes=%s" % (status, len(payload)))
 +            if status < 200 or status >= 300:
 +                raise SpeechDenied(502, "Upstream speech request failed")
@@ -403,7 +497,7 @@ diff --git a/mcpgateway/routers/llm_tts_router.py b/mcpgateway/routers/llm_tts_r
 new file mode 100644
 --- /dev/null
 +++ b/mcpgateway/routers/llm_tts_router.py
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,174 @@
 +"""POST /tts mounted beside the ContextForge 1.1.0 LLM proxy.
 +
 +Review artifact for tag v1.1.0 (aee91ff6db63b6aafa77522684a9483c418bb2a3).
@@ -415,10 +509,13 @@ new file mode 100644
 +
 +from __future__ import annotations
 +
++import asyncio
++import json
++
 +# Third-Party
 +from fastapi import APIRouter, Depends, HTTPException, Request
 +from fastapi.responses import Response
-+from pydantic import BaseModel, ConfigDict, Field
++from pydantic import BaseModel, ConfigDict, Field, ValidationError
 +from sqlalchemy import select
 +from sqlalchemy.orm import Session
 +
@@ -505,28 +602,44 @@ new file mode 100644
 +    }
 +
 +
++_BODY_KEYS = frozenset({"text", "language", "voice_id", "speed", "output_format", "with_timestamps"})
++
++
++def _parse_body(raw: bytes) -> TtsBody:
++    """Validate JSON without echoing the caller's text back in the error."""
++    try:
++        data = json.loads(raw)
++    except Exception:
++        raise HTTPException(status_code=422, detail="Invalid TTS request") from None
++    if not isinstance(data, dict) or not set(data).issubset(_BODY_KEYS):
++        raise HTTPException(status_code=422, detail="Invalid TTS request")
++    try:
++        return TtsBody.model_validate(data)
++    except ValidationError:
++        raise HTTPException(status_code=422, detail="Invalid TTS request") from None
++
++
 +# Public route: POST /tts  (full path is {LLM_API_PREFIX}/tts, household /llm/v1/tts).
 +@llm_tts_router.post("/tts", summary="Tablet text to speech")
 +@require_permission("llm.invoke", allow_admin_bypass=False)
 +async def text_to_speech(
 +    request: Request,
-+    body: TtsBody,
 +    db: Session = Depends(get_db),
 +    current_user: dict = Depends(get_current_user_with_permissions),
 +):
-+    """Speak one reply. Auth and the IP pin run before the upstream call.
++    """Speak one reply. Auth and the token IP pin run before the upstream call.
++
++    The inbound Authorization header is the tablet token. It is required
++    and is not an override. It is not copied upstream.
 +
 +    Credentials: llm_providers.id 78770f3fb044491fa06bfcc0d4b19825, then
-+    decode_auth(row.api_key)["api_key"]. The inbound Authorization header
-+    is the tablet token and is not copied upstream.
++    decode_auth(row.api_key)["api_key"].
 +    """
 +    if current_user is None or "email" not in current_user:
 +        raise HTTPException(status_code=401, detail="Authorization token required")
-+    override = tuple(
-+        key
-+        for key in FORBIDDEN_OVERRIDE_KEYS
-+        if key in request.query_params or key.lower() in {name.lower() for name in request.headers.keys()}
-+    )
++    # Query keys only. Do not treat the Authorization header as an override.
++    override = tuple(key for key in FORBIDDEN_OVERRIDE_KEYS if key in request.query_params)
++    body = _parse_body(await request.body())
 +    try:
 +        restrictions = await _ip_restrictions(request)
 +        access = AccessRequest(
@@ -540,16 +653,22 @@ new file mode 100644
 +        )
 +        if await request.is_disconnected():
 +            raise SpeechDenied(499, "Client cancelled")
-+        result = _proxy.speak(
-+            access,
-+            _provider_view(db),
-+            body.text,
-+            body.language,
-+            body.voice_id,
-+            body.speed,
-+            body.output_format,
-+            body.with_timestamps,
++        result = await asyncio.wait_for(
++            asyncio.to_thread(
++                _proxy.speak,
++                access,
++                _provider_view(db),
++                body.text,
++                body.language,
++                body.voice_id,
++                body.speed,
++                body.output_format,
++                body.with_timestamps,
++            ),
++            timeout=35,
 +        )
++    except asyncio.TimeoutError:
++        raise HTTPException(status_code=504, detail="TTS deadline exceeded") from None
 +    except SpeechDenied as exc:
 +        raise _denied(exc) from None
 +    return Response(content=result.body, media_type=result.content_type, status_code=result.status)

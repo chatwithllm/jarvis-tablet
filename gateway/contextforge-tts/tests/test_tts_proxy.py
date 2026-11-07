@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import re
@@ -15,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PROXY_PATH = ROOT / "mcpgateway" / "services" / "llm_tts_proxy.py"
 ROUTER_PATH = ROOT / "mcpgateway" / "routers" / "llm_tts_router.py"
 PATCH_PATH = ROOT / "contextforge-1.1.0-tts.patch"
+ARTIFACT_PATH = ROOT / "ARTIFACT.txt"
 
 spec = importlib.util.spec_from_file_location("llm_tts_proxy", PROXY_PATH)
 proxy = importlib.util.module_from_spec(spec)
@@ -470,6 +472,38 @@ class TtsProxyTests(unittest.TestCase):
         added_lines = [line[1:] for line in diff.splitlines() if line.startswith("+") and "re.compile" in line]
         self.assertEqual(added_lines, ['        ("POST", re.compile(rf"^{escaped_prefix}/tts/?$"), Permissions.LLM_INVOKE),'])
 
+    def test_token_pin_is_not_a_second_hardcoded_address(self):
+        proxy.authorize(_access(socket_ip="10.9.9.9", ip_restrictions=("10.9.9.9/32",)))
+
+    def test_oversized_upstream_body_is_closed_and_not_returned(self):
+        class Big:
+            def __init__(self):
+                self.closed = False
+                self.sent = 0
+
+            status = 200
+            headers = {"Content-Type": "audio/mpeg"}
+
+            def read(self, n=65536):
+                if self.sent > proxy.MAX_RESPONSE_BYTES:
+                    return b""
+                self.sent += n
+                return b"z" * n
+
+            def close(self):
+                self.closed = True
+
+        big = Big()
+
+        def opener(request, timeout=None):
+            return big
+
+        with self.assertRaises(proxy.SpeechDenied) as caught:
+            proxy.TtsProxy().speak(_access(), _provider(), "Hello", "en", "leo", opener=opener)
+        self.assertEqual(caught.exception.status, 502)
+        self.assertTrue(big.closed)
+        self.assertNotIn("zzz", caught.exception.detail)
+
     def test_v8_payload_shape(self):
         payload = proxy.build_tts_payload(
             "Good evening.",
@@ -517,6 +551,18 @@ class PatchRegressionTests(unittest.TestCase):
         # The chat and models lines are context, not deletions.
         self.assertNotIn("-        (\"POST\", re.compile", diff)
         self.assertNotIn("-        (\"GET\", re.compile", diff)
+
+    def test_artifact_hash_matches_patch_bytes(self):
+        raw = PATCH_PATH.read_bytes()
+        recorded = dict(
+            line.split("=", 1)
+            for line in ARTIFACT_PATH.read_text(encoding="utf-8").splitlines()
+            if "=" in line
+        )
+        self.assertEqual(recorded["sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(int(recorded["bytes"]), len(raw))
+        self.assertEqual(int(recorded["lines"]), raw.count(b"\n"))
+        self.assertEqual(recorded["version"], "1.1.0+tablet-tts.3")
 
 
 if __name__ == "__main__":
