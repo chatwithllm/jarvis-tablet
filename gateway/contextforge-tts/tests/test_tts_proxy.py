@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 import threading
 import unittest
@@ -39,9 +40,13 @@ def _provider():
     return {
         "id": proxy.FIXED_PROVIDER_ID,
         "enabled": True,
+        "provider_type": "openai_compatible",
         "api_base": "https://api.x.ai/v1",
         "api_key": "test-provider-key",
     }
+
+
+_LOG_LINE = re.compile(r"^tts upstream HTTP \d+ bytes=\d+$")
 
 
 class _Response:
@@ -192,11 +197,14 @@ class TtsProxyTests(unittest.TestCase):
         self.assertEqual(sent["language"], "en")
         self.assertEqual(sent["voice_id"], "leo")
         self.assertNotIn("with_timestamps", sent)
-        joined = "\n".join(logs)
-        self.assertNotIn("test-provider-key", joined)
-        self.assertNotIn("Good evening.", joined)
-        self.assertNotIn(audio.decode("utf-8"), joined)
-        self.assertIn("bytes=%s" % len(audio), joined)
+        self.assertEqual(logs, ["tts upstream HTTP 200 bytes=%s" % len(audio)])
+        for line in logs:
+            self.assertIsNotNone(_LOG_LINE.match(line))
+            self.assertNotIn("test-provider-key", line)
+            self.assertNotIn("Good evening.", line)
+            self.assertNotIn(audio.decode("utf-8"), line)
+        names = [name.lower() for name in seen["headers"]]
+        self.assertEqual(sorted(names), ["accept", "authorization", "content-type"])
 
     def test_tablet_bearer_is_not_an_upstream_header(self):
         _, seen = self._speak()
@@ -263,7 +271,11 @@ class TtsProxyTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.status, 502)
         self.assertNotIn("phrase-must-not-be-logged", caught.exception.detail)
-        self.assertNotIn("test-provider-key", " ".join(logs))
+        self.assertEqual(logs, ["tts upstream HTTP 500 bytes=0"])
+        for line in logs:
+            self.assertIsNotNone(_LOG_LINE.match(line))
+            self.assertNotIn("test-provider-key", line)
+            self.assertNotIn("phrase-must-not-be-logged", line)
 
     def test_non_mpeg_upstream_rejected(self):
         def opener(request, timeout=None):
@@ -344,6 +356,119 @@ class TtsProxyTests(unittest.TestCase):
         with self.assertRaises(proxy.SpeechDenied) as caught:
             proxy.resolve_provider(bad)
         self.assertEqual(caught.exception.status, 503)
+
+    def test_reported_token_scopes_pass_scope_check_only(self):
+        # Key Keeper metadata: the tablet token lists llm.read and llm.invoke.
+        # Passing this check is not evidence the provider can synthesize speech.
+        proxy.authorize(_access(permissions=("llm.read", "llm.invoke")))
+
+    def test_model_override_denied_before_upstream(self):
+        calls = []
+
+        def opener(request, timeout=None):
+            calls.append(1)
+            return _Response()
+
+        with self.assertRaises(proxy.SpeechDenied) as caught:
+            proxy.TtsProxy().speak(
+                _access(override_keys=("model",)),
+                _provider(),
+                "Hello",
+                "en",
+                "leo",
+                opener=opener,
+            )
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(calls, [])
+
+    def test_api_base_and_key_overrides_denied_before_upstream(self):
+        for key in ("api_base", "api_key", "authorization", "x-api-key"):
+            with self.assertRaises(proxy.SpeechDenied) as caught:
+                proxy.authorize(_access(override_keys=(key,)))
+            self.assertEqual(caught.exception.status, 400, key)
+
+    def test_provider_switching_voice_denied_before_upstream(self):
+        calls = []
+
+        def opener(request, timeout=None):
+            calls.append(1)
+            return _Response()
+
+        with self.assertRaises(proxy.SpeechDenied) as caught:
+            proxy.TtsProxy().speak(
+                _access(),
+                _provider(),
+                "Hello",
+                "en",
+                "openai/gpt-4o",
+                opener=opener,
+            )
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(calls, [])
+
+    def test_wrong_provider_type_before_upstream(self):
+        bad = _provider()
+        bad["provider_type"] = "openai"
+        with self.assertRaises(proxy.SpeechDenied) as caught:
+            proxy.resolve_provider(bad)
+        self.assertEqual(caught.exception.status, 503)
+
+    def test_missing_api_base_before_upstream(self):
+        bad = _provider()
+        bad["api_base"] = ""
+        with self.assertRaises(proxy.SpeechDenied) as caught:
+            proxy.resolve_provider(bad)
+        self.assertEqual(caught.exception.status, 503)
+
+    def test_speed_rate_out_of_range_before_upstream(self):
+        calls = []
+
+        def opener(request, timeout=None):
+            calls.append(1)
+            return _Response()
+
+        with self.assertRaises(proxy.SpeechDenied) as caught:
+            proxy.TtsProxy().speak(
+                _access(),
+                _provider(),
+                "Hello",
+                "en",
+                "leo",
+                speed=4.0,
+                opener=opener,
+            )
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(calls, [])
+
+    def test_request_rate_before_second_upstream(self):
+        calls = []
+
+        def opener(request, timeout=None):
+            calls.append(1)
+            return _Response()
+
+        client = proxy.TtsProxy(max_per_minute=1, clock=lambda: 1000.0)
+        client.speak(_access(), _provider(), "Hello", "en", "leo", opener=opener)
+        with self.assertRaises(proxy.SpeechDenied) as caught:
+            client.speak(_access(), _provider(), "Again", "en", "leo", opener=opener)
+        self.assertEqual(caught.exception.status, 429)
+        self.assertEqual(len(calls), 1)
+
+    def test_only_post_llm_v1_tts_pattern_is_added(self):
+        added = re.compile(r"^/llm/v1/tts/?$")
+        self.assertIsNotNone(added.match("/llm/v1/tts"))
+        self.assertIsNotNone(added.match("/llm/v1/tts/"))
+        for path in (
+            "/llm/v1/stt",
+            "/llm/v1/tts/voices",
+            "/llm/v1/chat/completions",
+            "/llm/v1/models",
+            "/v1/tts",
+        ):
+            self.assertIsNone(added.match(path), path)
+        diff = PATCH_PATH.read_text(encoding="utf-8")
+        added_lines = [line[1:] for line in diff.splitlines() if line.startswith("+") and "re.compile" in line]
+        self.assertEqual(added_lines, ['        ("POST", re.compile(rf"^{escaped_prefix}/tts/?$"), Permissions.LLM_INVOKE),'])
 
     def test_v8_payload_shape(self):
         payload = proxy.build_tts_payload(

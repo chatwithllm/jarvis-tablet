@@ -13,26 +13,41 @@ from __future__ import annotations
 import ipaddress
 import json
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, Mapping, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-PATCH_VERSION = "1.1.0+tablet-tts.1"
+PATCH_VERSION = "1.1.0+tablet-tts.2"
 FIXED_PROVIDER_ID = "78770f3fb044491fa06bfcc0d4b19825"
+REQUIRED_PROVIDER_TYPE = "openai_compatible"
+REQUIRED_API_BASE = "https://api.x.ai/v1"
 UPSTREAM_TTS = "https://api.x.ai/v1/tts"
 TABLET_CIDR = "192.168.20.109/32"
 REQUIRED_PERMISSION = "llm.invoke"
 
 MAX_TTS_CHARS = 4_000
 MAX_IN_FLIGHT = 2
+MAX_PER_MINUTE = 30
 UPSTREAM_TIMEOUT_SECONDS = 30.0
 
 ALLOWED_VOICES = frozenset(
     {"leo", "altair", "lux", "eve", "rex", "sal", "ara", "rigel"}
 )
 FORBIDDEN_OVERRIDE_KEYS = frozenset(
-    {"provider", "provider_id", "url", "upstream", "base_url", "model", "api_key"}
+    {
+        "provider",
+        "provider_id",
+        "url",
+        "upstream",
+        "base_url",
+        "api_base",
+        "model",
+        "api_key",
+        "authorization",
+        "x-api-key",
+    }
 )
 
 
@@ -145,19 +160,22 @@ def _ip_allowed(client_ip: Optional[str], restrictions: tuple) -> bool:
 
 
 def resolve_provider(provider: Optional[Mapping]) -> str:
-    """Return the stored xAI key. The host is not taken from the client.
+    """Return the stored xAI key for the pinned xai-tablet row only.
 
-    ``provider['api_key']`` is the plaintext key already decoded from the
-    llm_providers ciphertext. Callers must not log the returned string.
+    The id, provider_type, and api_base must match the Key Keeper
+    metadata. That metadata is not a TTS capability check. The key is
+    the plaintext already produced by decode_auth on the stored
+    ciphertext. Callers must not log it. A client api_base or key is
+    not read here.
     """
     if not provider or provider.get("id") != FIXED_PROVIDER_ID:
         raise SpeechDenied(503, "Speech provider is not configured")
     if provider.get("enabled") is False:
         raise SpeechDenied(503, "Speech provider is disabled")
-    base = (provider.get("api_base") or "https://api.x.ai/v1").rstrip("/")
-    if base == "https://api.x.ai":
-        base = "https://api.x.ai/v1"
-    if base != "https://api.x.ai/v1":
+    if str(provider.get("provider_type") or "") != REQUIRED_PROVIDER_TYPE:
+        raise SpeechDenied(503, "Speech provider type is not openai_compatible")
+    base = str(provider.get("api_base") or "").strip().rstrip("/")
+    if base != REQUIRED_API_BASE:
         raise SpeechDenied(503, "Speech provider host is not api.x.ai")
     key = provider.get("api_key") or ""
     if not isinstance(key, str) or not key.strip():
@@ -187,7 +205,7 @@ def build_tts_payload(
     if not isinstance(language, str) or language.strip().lower() != "en":
         raise SpeechDenied(400, "language must be en")
     voice = (voice_id or "").strip().lower()
-    if voice not in ALLOWED_VOICES:
+    if "/" in voice or ":" in voice or voice not in ALLOWED_VOICES:
         raise SpeechDenied(400, "TTS voice is not allowed")
     try:
         pace = float(speed)
@@ -228,12 +246,17 @@ class TtsProxy:
     def __init__(
         self,
         max_in_flight: int = MAX_IN_FLIGHT,
+        max_per_minute: int = MAX_PER_MINUTE,
         timeout: float = UPSTREAM_TIMEOUT_SECONDS,
         log: LogFn = _noop_log,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self._slots = max_in_flight
+        self._max_per_minute = max_per_minute
         self._timeout = timeout
         self._log = log
+        self._clock = clock
+        self._recent: list = []
         self._lock = threading.Lock()
 
     def speak(
@@ -262,7 +285,16 @@ class TtsProxy:
             with_timestamps,
         )
         body = json.dumps(payload).encode("utf-8")
+        self._charge_rate()
         return self._send(key, body, opener, cancel)
+
+    def _charge_rate(self) -> None:
+        now = self._clock()
+        with self._lock:
+            self._recent = [stamp for stamp in self._recent if now - stamp < 60.0]
+            if len(self._recent) >= self._max_per_minute:
+                raise SpeechDenied(429, "TTS rate limit")
+            self._recent.append(now)
 
     def _send(
         self,
@@ -294,13 +326,13 @@ class TtsProxy:
             except SpeechDenied:
                 raise
             except HTTPError as exc:
-                self._log("tts upstream HTTP %s" % exc.code)
+                self._log("tts upstream HTTP %s bytes=0" % exc.code)
                 raise SpeechDenied(502, "Upstream speech request failed") from None
             except URLError:
-                self._log("tts upstream unreachable")
+                self._log("tts upstream HTTP 0 bytes=0")
                 raise SpeechDenied(502, "Upstream speech request failed") from None
             except Exception:
-                self._log("tts upstream failed")
+                self._log("tts upstream HTTP 0 bytes=0")
                 raise SpeechDenied(502, "Upstream speech request failed") from None
             status = getattr(response, "status", None) or getattr(response, "code", 200)
             raw_type = ""

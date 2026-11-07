@@ -1,6 +1,6 @@
 # TTS route checklist for IT Admin
 
-Artifact: `contextforge-1.1.0-tts.patch` (version `1.1.0+tablet-tts.1`).
+Artifact: `contextforge-1.1.0-tts.patch` (version `1.1.0+tablet-tts.2`).
 
 This is a review package. Deploy, restart, permission changes, Caddy edits, and any call to xAI are not approved.
 
@@ -21,11 +21,23 @@ Only `POST /llm/v1/tts` when `LLM_API_PREFIX=/llm/v1`.
 
 No STT route, no `/tts/voices`, no generic proxy, no new token, no grant, no Caddy change.
 
+## Key Keeper metadata (not a capability proof)
+
+Read-only metadata, reviewed as labels only. It does not show that `POST /llm/v1/tts` is routed, and it does not show that the provider can synthesize speech. Provider health and the xAI console TTS capability were not checked. No paid upstream call is authorized.
+
+- Active tablet token scopes: `llm.read` and `llm.invoke` only.
+- That token's IP pin is still `192.168.20.109/32`.
+- Enabled provider `xai-tablet`, id `78770f3fb044491fa06bfcc0d4b19825`, type `openai_compatible`, `api_base` `https://api.x.ai/v1`.
+
+The handler hard-binds that id, that type, and that exact base. A client `model`, `provider`, `api_base`, `api_key`, `Authorization`, or `X-Api-Key` does not select a provider. `voice_id` must be one of the stock allowlist (`leo`, `altair`, `lux`, `eve`, `rex`, `sal`, `ara`, `rigel`). A value with `/` or `:` is rejected. The operation map adds `llm.invoke` for `POST /llm/v1/tts` only. `POST /llm/v1/stt`, `GET /llm/v1/tts/voices`, and every other unmapped path stay on the existing default deny.
+
 ## How the stored xAI key is used
 
-The tablet sends `Authorization: Bearer` with `cf-jarvis-tablet-llm`. `get_current_user_with_permissions` validates that token. The route then requires `llm.invoke` with `allow_admin_bypass=False`.
+The tablet sends `Authorization: Bearer` with `cf-jarvis-tablet-llm`. `get_current_user_with_permissions` validates that token. The route then requires `llm.invoke` with `allow_admin_bypass=False`. A token whose explicit scopes are only `llm.read` is denied. The reported pair `llm.read` plus `llm.invoke` satisfies that scope check. Satisfying it is not a TTS probe.
 
-The upstream bearer is not that token. The handler loads `llm_providers.id = 78770f3fb044491fa06bfcc0d4b19825` and calls `decode_auth(row.api_key)`, which decrypts the ciphertext already stored on that row (`encode_auth({"api_key": ...})` in `mcpgateway/utils/services_auth.py`, secret `AUTH_ENCRYPTION_SECRET` on the gateway). `decoded["api_key"]` is the only upstream `Authorization` value. It is not logged. `api_base` must be empty, `https://api.x.ai`, or `https://api.x.ai/v1`. Any other host is rejected before a connection.
+The upstream bearer is not the tablet token. No client header is copied. The handler loads `llm_providers.id = 78770f3fb044491fa06bfcc0d4b19825` and calls `decode_auth(row.api_key)`, which decrypts the ciphertext already stored on that row (`encode_auth({"api_key": ...})` in `mcpgateway/utils/services_auth.py`, secret `AUTH_ENCRYPTION_SECRET` on the gateway). `decoded["api_key"]` is the only upstream `Authorization` value. The stored `api_base` must be exactly `https://api.x.ai/v1`, and `provider_type` must be `openai_compatible`. Anything else is 503 before a connection.
+
+Logs from this route are status and byte counts only (`tts upstream HTTP <status> bytes=<n>`). Do not treat an older "logging is off" note as evidence. The mock tests assert the log lines even when the logger is recording.
 
 ## IP pin and Caddy
 
@@ -69,7 +81,7 @@ curl -sS -D - -o /tmp/out.mp3 -X POST \
   -d '{"text":"Good evening.","voice_id":"leo","language":"en","speed":1.08,"output_format":{"codec":"mp3","sample_rate":24000,"bit_rate":128000}}'
 ```
 
-Expect HTTP 200 and `Content-Type: audio/mpeg`. The file should be playable. Gateway logs may show a status and a byte count. They must not show the text, the audio, or either bearer.
+Expect HTTP 200 and `Content-Type: audio/mpeg` only after a future approved restart. That result is not claimed here. If it is ever run, logs from this route must be status and size only, even if gateway logging is on. They must not show the text, the audio, or either bearer. Provider health remains unverified until that separate decision.
 
 From any other source address:
 

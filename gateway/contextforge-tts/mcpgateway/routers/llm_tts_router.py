@@ -21,6 +21,7 @@ from mcpgateway.db import LLMProvider, get_db
 from mcpgateway.middleware.rbac import get_current_user_with_permissions, require_permission
 from mcpgateway.services.llm_tts_proxy import (
     FIXED_PROVIDER_ID,
+    FORBIDDEN_OVERRIDE_KEYS,
     AccessRequest,
     SpeechDenied,
     TtsProxy,
@@ -92,6 +93,7 @@ def _provider_view(db: Session) -> dict | None:
     return {
         "id": row.id,
         "enabled": bool(row.enabled),
+        "provider_type": row.provider_type,
         "api_base": row.api_base,
         "api_key": plaintext,
     }
@@ -116,8 +118,8 @@ async def text_to_speech(
         raise HTTPException(status_code=401, detail="Authorization token required")
     override = tuple(
         key
-        for key in ("provider", "provider_id", "url", "upstream", "base_url", "model", "api_key")
-        if key in request.query_params or key in request.headers
+        for key in FORBIDDEN_OVERRIDE_KEYS
+        if key in request.query_params or key.lower() in {name.lower() for name in request.headers.keys()}
     )
     try:
         restrictions = await _ip_restrictions(request)
