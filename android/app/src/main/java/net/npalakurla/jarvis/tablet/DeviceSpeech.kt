@@ -12,8 +12,11 @@ import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -59,12 +62,87 @@ class DeviceSpeech(private val context: Context) {
                 val available = runCatching {
                     SpeechRecognizer.isRecognitionAvailable(context)
                 }.getOrDefault(false)
-                if (!available) ListenResult(null, "recognizer_unavailable")
-                else listenOnMain(timeoutMs, onPartial, onLevel)
+                if (!available) {
+                    // Lenovo Tab P11 has no SpeechRecognizer. The bundled
+                    // Vosk model transcribes in free-form mode instead.
+                    // Recording blocks, so it stays off the main thread.
+                    withContext(Dispatchers.IO) {
+                        Log.i("JarvisVoice", "stt=vosk")
+                        listenWithVosk(onLevel)
+                    }
+                } else {
+                    listenOnMain(timeoutMs, onPartial, onLevel)
+                }
             }
         } finally {
             if (manageWakeMic) WakeService.resumeMic()
         }
+    }
+
+    /** Record one utterance and transcribe it with the wake model, no grammar. */
+    private suspend fun listenWithVosk(onLevel: (Double) -> Unit): ListenResult {
+        if (!VoskWakeEngine.modelReady(context)) return ListenResult(null, "recognizer_unavailable")
+        val pcm = recordPcm(onLevel) ?: return ListenResult(null, "no_match")
+        val text = VoskWakeEngine.transcribe(context, pcm)?.trim().orEmpty()
+        return if (text.isEmpty()) ListenResult(null, "no_match") else ListenResult(text, null)
+    }
+
+    private suspend fun recordPcm(onLevel: (Double) -> Unit): ShortArray? {
+        val bufferSize = android.media.AudioRecord.getMinBufferSize(
+            VoiceTurn.SAMPLE_RATE,
+            android.media.AudioFormat.CHANNEL_IN_MONO,
+            android.media.AudioFormat.ENCODING_PCM_16BIT,
+        ).coerceAtLeast(VoiceTurn.FRAME_SAMPLES * 2) * 2
+        val rec = android.media.AudioRecord(
+            android.media.MediaRecorder.AudioSource.MIC,
+            VoiceTurn.SAMPLE_RATE,
+            android.media.AudioFormat.CHANNEL_IN_MONO,
+            android.media.AudioFormat.ENCODING_PCM_16BIT,
+            bufferSize,
+        )
+        rec.startRecording()
+        val frames = ArrayList<ShortArray>()
+        val frame = ShortArray(VoiceTurn.FRAME_SAMPLES)
+        var heard = false
+        var silenceMs = 0L
+        var totalMs = 0L
+        try {
+            while (currentCoroutineContext().isActive && totalMs < VoiceTurn.MAX_TURN_MS) {
+                val read = rec.read(frame, 0, VoiceTurn.FRAME_SAMPLES)
+                if (read <= 0) {
+                    yield()
+                    continue
+                }
+                var sum = 0.0
+                for (i in 0 until read) {
+                    val v = frame[i] / 32768.0
+                    sum += v * v
+                }
+                val level = kotlin.math.sqrt(sum / read).coerceIn(0.0, 1.0)
+                onLevel(level)
+                if (level > VoiceTurn.SPEECH_LEVEL) {
+                    heard = true
+                    silenceMs = 0
+                } else if (heard) {
+                    silenceMs += VoiceTurn.FRAME_MS
+                }
+                frames.add(frame.copyOf(read))
+                totalMs += VoiceTurn.FRAME_MS
+                if (heard && silenceMs >= VoiceTurn.SILENCE_END_MS) break
+            }
+        } finally {
+            runCatching { rec.stop() }
+            rec.release()
+        }
+        if (!heard) return null
+        val total = frames.sumOf { it.size }
+        val pcm = ShortArray(total)
+        var at = 0
+        for (chunk in frames) {
+            chunk.copyInto(pcm, at)
+            at += chunk.size
+        }
+        return pcm
     }
 
     /** True = yes, false = no, null = not a confirm phrase (or nothing heard). */

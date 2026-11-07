@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item type="id" name="field_cf_url" />
+    <item type="id" name="field_cf_token" />
+    <item type="id" name="field_relay_url" />
+    <item type="id" name="field_llm_url" />
+    <item type="id" name="field_llm_model" />
+    <item type="id" name="field_llm_token" />
+    <item type="id" name="field_wake_confidence" />
+</resources>

@@ -80,8 +80,8 @@ object WakePhrases {
     }
 
     private val FALLBACK = Catalog(
-        choices = listOf("hey jack", "hey tablet", "okay computer"),
-        defaults = setOf("hey jack", "hey tablet", "okay computer"),
+        choices = listOf("okay computer", "hey tablet", "hey jack"),
+        defaults = setOf("okay computer", "hey tablet", "hey jack"),
         rejects = setOf(
             "hey jarvis", "hi jarvis", "ok jarvis", "okay jarvis",
             "hey jackson", "hey jackie", "hey john", "hey jake",

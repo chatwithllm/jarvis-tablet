@@ -47,7 +47,7 @@ class WakeService : Service() {
             NOTIFICATION_ID,
             NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("Jarvis listening")
-                .setContentText("Wake listening — hey jack, hey tablet, or okay computer")
+                .setContentText("Wake listening — okay computer, hey tablet, or hey jack")
                 .setSmallIcon(R.drawable.ic_launcher)
                 .setOngoing(true)
                 .build(),

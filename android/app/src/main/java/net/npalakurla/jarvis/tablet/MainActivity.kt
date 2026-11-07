@@ -49,6 +49,8 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
     private var heartbeatJob: Job? = null
     private var wakeEnabled = true
     private lateinit var voiceTurn: VoiceTurn
+    /** This instance's DEBUG_TURN_WAV hook. Compared by identity in onDestroy. */
+    private var debugTurnHandler: ((String?, Boolean) -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -71,7 +73,8 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
         )
         // A wake word starts a turn (the HUD event goes out too).
         bridge.onWakeDetected = { voiceTurn.start() }
-        VoiceDebug.handler = { path -> voiceTurn.startFromWav(path) }
+        debugTurnHandler = { path, direct -> voiceTurn.startFromWav(path, direct) }
+        VoiceDebug.handler = debugTurnHandler
         maybeRequestBatteryExemption()
         maybeRequestMicPermission()
         startWakeServiceIfConfigured()
@@ -117,6 +120,10 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
 
     override fun onResume() {
         super.onResume()
+        // Coming back from Settings can destroy the previous MainActivity
+        // after this one is already alive. Re-claim the debug broadcast
+        // so DEBUG_TURN_WAV does not log result=no_activity.
+        debugTurnHandler?.let { VoiceDebug.handler = it }
         WakeService.listener = bridge
         pushStatus()
     }
@@ -128,7 +135,10 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
 
     override fun onDestroy() {
         heartbeatJob?.cancel()
-        VoiceDebug.handler = null
+        // A newer MainActivity may already own the hook. Clearing it
+        // unconditionally drops DEBUG_TURN_WAV / the wake-debug path's
+        // turn handler (result=no_activity) after a Settings round-trip.
+        if (VoiceDebug.handler === debugTurnHandler) VoiceDebug.handler = null
         if (::voiceTurn.isInitialized) voiceTurn.close()
         super.onDestroy()
     }
@@ -208,7 +218,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
                 "error",
                 JSONObject()
                     .put("code", "mic_permission")
-                    .put("message", "Microphone permission denied — voice is off. Grant it in Settings to enable Hey Jack and tap-to-talk."),
+                    .put("message", "Microphone permission denied — voice is off. Grant it in Settings to enable okay computer and tap-to-talk."),
             )
         }
     }

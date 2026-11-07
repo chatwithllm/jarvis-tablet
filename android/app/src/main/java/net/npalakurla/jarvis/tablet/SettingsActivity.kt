@@ -4,6 +4,7 @@ import android.content.Intent
 import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
+import android.view.View
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
@@ -31,30 +32,32 @@ class SettingsActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val urlInput = field("ContextForge URL (MCP endpoint)").apply {
+        val urlInput = field("ContextForge URL (MCP endpoint)", R.id.field_cf_url).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             setText(TokenStore.getCfUrl(this@SettingsActivity) ?: TokenStore.DEFAULT_CF_URL)
         }
         val tokenSaved = TokenStore.getCfToken(this) != null
-        val tokenInput = field(
+        val tokenInput = secretField(
             if (tokenSaved) "ContextForge MCP bearer — saved" else "ContextForge MCP bearer (cf-jarvis-tablet)",
+            R.id.field_cf_token,
         ).apply {
             if (tokenSaved) setText(TokenStore.SAVED_TOKEN_MASK)
         }
-        val relayInput = field("Voice relay URL (Mini) — optional, used as fallback").apply {
+        val relayInput = field("Voice relay URL (Mini) — optional, used as fallback", R.id.field_relay_url).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             setText(TokenStore.getVoiceRelayUrl(this@SettingsActivity))
         }
-        val llmUrlInput = field("LLM base URL (ContextForge /llm/v1)").apply {
+        val llmUrlInput = field("LLM base URL (ContextForge /llm/v1)", R.id.field_llm_url).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             setText(TokenStore.getLlmBaseUrl(this@SettingsActivity))
         }
-        val llmModelInput = field("LLM model (default grok-4.7)").apply {
+        val llmModelInput = field("LLM model (default grok-4.7)", R.id.field_llm_model).apply {
             setText(TokenStore.getLlmModel(this@SettingsActivity))
         }
         val llmSaved = TokenStore.hasLlmCredentials(this)
-        val llmTokenInput = field(
+        val llmTokenInput = secretField(
             if (llmSaved) "LLM bearer — saved" else "LLM bearer (cf-jarvis-tablet-llm)",
+            R.id.field_llm_token,
         ).apply {
             if (llmSaved) setText(TokenStore.SAVED_TOKEN_MASK)
         }
@@ -79,7 +82,7 @@ class SettingsActivity : AppCompatActivity() {
                 textSize = 18f
             }
         }
-        val confInput = field("Wake confidence 0.50–0.99 (default 0.85)").apply {
+        val confInput = field("Wake confidence 0.50–0.99 (default 0.85)", R.id.field_wake_confidence).apply {
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
             setText(String.format(java.util.Locale.US, "%.2f", wakeNow.threshold))
         }
@@ -197,12 +200,22 @@ class SettingsActivity : AppCompatActivity() {
         setContentView(ScrollView(this).apply { addView(layout) })
     }
 
-    private fun field(hintText: String): EditText = EditText(this).apply {
+    private fun field(hintText: String, fieldId: Int): EditText = EditText(this).apply {
+        id = fieldId
+        contentDescription = resources.getResourceEntryName(fieldId)
+        importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
         hint = hintText
+        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = 20 }
+    }
+
+    private fun secretField(hintText: String, fieldId: Int): EditText = field(hintText, fieldId).apply {
+        inputType = InputType.TYPE_CLASS_TEXT or
+            InputType.TYPE_TEXT_VARIATION_PASSWORD or
+            InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
     }
 
     private fun toast(message: String) {

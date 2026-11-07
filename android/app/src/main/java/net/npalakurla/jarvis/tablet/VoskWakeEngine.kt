@@ -108,6 +108,53 @@ object VoskWakeEngine {
         }
     }
 
+    /** True once the bundled model is unpacked and the grammar recognizer exists. */
+    fun modelReady(context: Context): Boolean = synchronized(lock) { ensureReady(context) }
+
+    /**
+     * Free-form speech-to-text on the same small model (no wake grammar).
+     * Used when Android SpeechRecognizer is missing, and for a debug WAV
+     * on the direct path. Returns null when nothing was recognized.
+     * The transcript is not logged.
+     */
+    fun transcribe(context: Context, pcm: ShortArray): String? {
+        if (pcm.isEmpty()) return null
+        injecting = true
+        try {
+            synchronized(lock) {
+                if (!ensureReady(context)) return null
+                val voskModel = model ?: return null
+                val rate = (catalog?.sampleRate ?: 16_000).toFloat()
+                val recognizer = Recognizer(voskModel, rate)
+                try {
+                    recognizer.setWords(true)
+                    val parts = ArrayList<String>()
+                    var offset = 0
+                    while (offset < pcm.size) {
+                        val n = minOf(4_000, pcm.size - offset)
+                        val slice = ShortArray(n)
+                        System.arraycopy(pcm, offset, slice, 0, n)
+                        if (recognizer.acceptWaveForm(slice, n)) {
+                            collectText(recognizer.result, parts)
+                        }
+                        offset += n
+                    }
+                    collectText(recognizer.finalResult, parts)
+                    return parts.joinToString(" ").trim().ifEmpty { null }
+                } finally {
+                    runCatching { recognizer.close() }
+                }
+            }
+        } finally {
+            injecting = false
+        }
+    }
+
+    private fun collectText(json: String, parts: MutableList<String>) {
+        val text = runCatching { JSONObject(json).optString("text") }.getOrDefault("").trim()
+        if (text.isNotEmpty()) parts.add(text)
+    }
+
     fun close() {
         synchronized(lock) {
             session?.close()

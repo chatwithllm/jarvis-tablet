@@ -192,7 +192,10 @@ class HaClient(private val context: Context) {
      */
     internal fun callServiceBlocking(domain: String, service: String, entityId: String): Result<Unit> =
         runCatching {
-            if (PolicyController.isRefused(domain, entityId, service = service)) {
+            if (SafetyGate.refusesTool(domain, entityId, service, null) ||
+                PolicyController.isRefused(domain, entityId, service = service)
+            ) {
+                Log.i("JarvisVoice", "refused=safety")
                 throw IllegalStateException("refused by policy")
             }
             if (!service.matches(Regex("[a-z0-9_]{1,64}"))) {

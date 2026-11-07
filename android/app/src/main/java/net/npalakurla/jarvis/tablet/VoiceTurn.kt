@@ -152,18 +152,19 @@ class VoiceTurn(
 
     /**
      * Debug path: run one full turn from a 16 kHz mono WAV instead of
-     * the microphone. The relay accepts that audio. A saved LLM token
-     * still falls through to the relay here, because this build cannot
-     * speech-recognize a file on Android 11.
+     * the microphone. `direct` transcribes with the bundled Vosk model
+     * and posts the text to /llm/v1. Otherwise the WAV goes to the relay.
+     * An unsafe transcript is refused before either call.
      */
-    fun startFromWav(path: String?) {
+    fun startFromWav(path: String?, direct: Boolean = false) {
         Log.i(VOICE, "debug_wav")
         if (isActive) {
             Log.i(VOICE, "result=busy")
             return
         }
         val file = path?.let { File(it) }
-        if (file == null || !file.isFile || DebugWake.decodeWav(file) == null) {
+        val pcm = if (file != null && file.isFile) DebugWake.decodeWav(file) else null
+        if (file == null || pcm == null) {
             Log.i(VOICE, "result=bad_wav")
             bridge.sendEvent(
                 "error",
@@ -177,10 +178,33 @@ class VoiceTurn(
         WakeService.muteTailMs = TURN_MUTE_MS
         turnJob = scope.launch {
             try {
-                // A file has no on-device transcript on Android 11, so the
-                // WAV turn always uses the relay. A live tap still tries
-                // /llm/v1 first when that token is saved.
-                Log.i(VOICE, "path=relay")
+                val heard = VoskWakeEngine.transcribe(context, pcm)
+                if (SafetyGate.block(heard)) {
+                    showRefused()
+                    return@launch
+                }
+                if (direct) {
+                    Log.i(VOICE, "path=direct")
+                    Log.i(VOICE, "stt=vosk")
+                    if (heard.isNullOrBlank()) {
+                        Log.i(VOICE, "result=silent")
+                        bridge.sendEvent("tts_finished", JSONObject())
+                        return@launch
+                    }
+                    val llm = transport.completeText(heard)
+                    if (llm.isSuccess) {
+                        Log.i(VOICE, "result=ok")
+                        present(llm.getOrThrow())
+                        return@launch
+                    }
+                    val http = (llm.exceptionOrNull() as? LlmCallFailed)?.http ?: 0
+                    if (http == 401 || http == 403) {
+                        Log.i(VOICE, "result=llm_auth")
+                    }
+                    Log.i(VOICE, "path=relay")
+                } else {
+                    Log.i(VOICE, "path=relay")
+                }
                 val result = transport.runTurn(wav)
                 val value = result.getOrElse {
                     Log.i(VOICE, "result=error")
@@ -264,6 +288,10 @@ class VoiceTurn(
         }
         val transcript = heard.transcript?.trim().orEmpty()
         if (transcript.isNotEmpty()) {
+            if (SafetyGate.block(transcript)) {
+                showRefused()
+                return
+            }
             bridge.sendEvent("thinking", JSONObject().put("step", "transcribing"))
             val direct = transport.completeText(transcript)
             if (direct.isSuccess) {
@@ -300,6 +328,7 @@ class VoiceTurn(
         when (attempt) {
             RelayAttempt.Presented -> Log.i(VOICE, "result=ok")
             RelayAttempt.Silent -> Log.i(VOICE, "result=silent")
+            RelayAttempt.Refused -> Unit
             RelayAttempt.Unconfigured -> {
                 Log.i(VOICE, "result=error")
                 bridge.sendEvent(
@@ -347,6 +376,7 @@ class VoiceTurn(
         data object Presented : RelayAttempt()
         data object Silent : RelayAttempt()
         data object Unconfigured : RelayAttempt()
+        data object Refused : RelayAttempt()
         data class Failed(val error: Throwable) : RelayAttempt()
     }
 
@@ -363,11 +393,26 @@ class VoiceTurn(
             bridge.sendEvent("tts_finished", JSONObject())
             return RelayAttempt.Silent
         }
+        val heard = wavToPcm(audio)?.let { pcm16leToShorts(it) }?.let { VoskWakeEngine.transcribe(context, it) }
+        if (SafetyGate.block(heard)) {
+            showRefused()
+            return RelayAttempt.Refused
+        }
         bridge.sendEvent("thinking", JSONObject().put("step", "transcribing"))
         val result = transport.runTurn(audio)
         val value = result.getOrElse { return RelayAttempt.Failed(it) }
         present(value)
         return RelayAttempt.Presented
+    }
+
+    private fun showRefused() {
+        bridge.sendEvent(
+            "refused",
+            JSONObject()
+                .put("reason", "denied")
+                .put("message", "That is not allowed by voice."),
+        )
+        bridge.sendEvent("tts_finished", JSONObject())
     }
 
     private suspend fun present(result: TurnResult) {
@@ -398,6 +443,22 @@ class VoiceTurn(
      * or failed (confirmed, but the execute call did not succeed).
      */
     private suspend fun confirmAction(action: ProposedAction): String {
+        if (SafetyGate.refusesTool(action.domain, action.entityId, action.service, action.summary) ||
+            SafetyGate.refuses(action.newState)
+        ) {
+            Log.i(VOICE, "refused=safety")
+            bridge.sendEvent(
+                "refused",
+                JSONObject()
+                    .put("reason", "denied")
+                    .put("message", "That is not allowed by voice."),
+            )
+            bridge.sendEvent(
+                "confirm_resolved",
+                JSONObject().put("id", action.id).put("outcome", "refused"),
+            )
+            return "refused"
+        }
         val pending = PolicyController.propose(
             summary = action.summary,
             domain = action.domain,
@@ -697,6 +758,19 @@ class VoiceTurn(
     }
 
     /** Extract the PCM payload from a WAV (find the "data" chunk). */
+    private fun pcm16leToShorts(pcm: ByteArray): ShortArray {
+        val n = pcm.size / 2
+        val out = ShortArray(n)
+        var i = 0
+        while (i < n) {
+            val lo = pcm[i * 2].toInt() and 0xFF
+            val hi = pcm[i * 2 + 1].toInt()
+            out[i] = ((hi shl 8) or lo).toShort()
+            i++
+        }
+        return out
+    }
+
     private fun wavToPcm(wav: ByteArray): ByteArray? {
         var i = 0
         while (i + 8 <= wav.size) {

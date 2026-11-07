@@ -14,8 +14,8 @@ android {
         applicationId = "net.npalakurla.jarvis.tablet"
         minSdk = 30 // Lenovo TB-J606F runs Android 11 (API 30)
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.4.2-settings-voice"
+        versionCode = 7
+        versionName = "0.4.5-safety"
         // TB-J606F is arm64. Dropping the other ABIs keeps Vosk (and any
         // leftover native deps) from shipping three extra copies of libvosk.
         ndk {
@@ -163,4 +163,5 @@ dependencies {
     // Offline wake recognizer (Apache-2.0). arm64 only, see ndk.abiFilters.
     // Replaces onnxruntime: hey_jack.onnx did not detect real speech.
     implementation("com.alphacephei:vosk-android:0.3.75")
+    testImplementation("junit:junit:4.13.2")
 }
