@@ -11,8 +11,13 @@ android {
         applicationId = "net.npalakurla.jarvis.tablet"
         minSdk = 30 // Lenovo TB-J606F runs Android 11 (API 30)
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.4.0-phase4"
+        versionCode = 3
+        versionName = "0.4.1-vosk-wake"
+        // TB-J606F is arm64. Dropping the other ABIs keeps Vosk (and any
+        // leftover native deps) from shipping three extra copies of libvosk.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
 
     // Issue #18: the debug build type had NO explicit signingConfig,
@@ -73,21 +78,77 @@ val copyHud by tasks.registering(Copy::class) {
     exclude("README.md")
 }
 
-// Bundle the wake-word models: copy wake/*.onnx into the APK assets
-// before every build. wake/ is the source of truth (the trained
-// hey_jack.onnx + the shared openWakeWord melspectrogram/embedding
-// models); android/app/src/main/assets/wake is generated (gitignored).
-// When hey_jack.onnx does not exist yet, the copy is a no-op and
-// WakeModel reports "missing" (normal until Phase 2 training lands).
-val copyWakeModels by tasks.registering(Copy::class) {
-    from(rootProject.file("../wake")) {
-        include("*.onnx")
-    }
-    into(layout.projectDirectory.dir("src/main/assets/wake"))
+// Grammar + Vosk model are generated under build/, then added as an
+// asset root. wake/phrases.json stays the source of truth for the
+// desktop eval script. The model is not committed.
+val generatedWakeAssets = layout.buildDirectory.dir("generated/vosk-assets")
+android.sourceSets.getByName("main").assets.srcDir(generatedWakeAssets)
+
+val copyWakePhrases by tasks.registering(Copy::class) {
+    from(rootProject.file("../wake/phrases.json"))
+    into(generatedWakeAssets)
 }
+
+// Vosk small en-US (Apache-2.0). SHA-256 is the zip published at
+// alphacephei.com for vosk-model-small-en-us-0.15.
+val downloadVoskModel by tasks.registering {
+    val assetsDir = layout.buildDirectory.dir("generated/vosk-assets/vosk-model").get().asFile
+    val marker = File(assetsDir, "conf/model.conf")
+    outputs.file(marker)
+    doLast {
+        if (marker.exists() && marker.length() > 0) return@doLast
+        val expected = "30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498"
+        val zip = layout.buildDirectory.file("downloads/vosk-model-small-en-us-0.15.zip").get().asFile
+        zip.parentFile.mkdirs()
+        if (!zip.exists() || sha256File(zip) != expected) {
+            java.net.URI("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip")
+                .toURL()
+                .openStream()
+                .use { input -> zip.outputStream().use { input.copyTo(it) } }
+            val got = sha256File(zip)
+            if (got != expected) {
+                zip.delete()
+                throw GradleException("vosk model sha256 mismatch: $got")
+            }
+        }
+        val unpack = layout.buildDirectory.dir("vosk-unpack").get().asFile
+        unpack.deleteRecursively()
+        unpack.mkdirs()
+        project.copy {
+            from(project.zipTree(zip))
+            into(unpack)
+        }
+        val inner = File(unpack, "vosk-model-small-en-us-0.15")
+        if (!inner.isDirectory) throw GradleException("vosk zip layout unexpected")
+        assetsDir.deleteRecursively()
+        inner.copyRecursively(assetsDir)
+        if (!marker.exists()) throw GradleException("vosk model.conf missing after unpack")
+    }
+}
+
+fun sha256File(file: File): String {
+    val digest = java.security.MessageDigest.getInstance("SHA-256")
+    file.inputStream().use { input ->
+        val buf = ByteArray(1 shl 16)
+        while (true) {
+            val n = input.read(buf)
+            if (n < 0) break
+            digest.update(buf, 0, n)
+        }
+    }
+    return digest.digest().joinToString("") { "%02x".format(it) }
+}
+
 tasks.named("preBuild").configure {
     dependsOn(copyHud)
-    dependsOn(copyWakeModels)
+    dependsOn(copyWakePhrases)
+    dependsOn(downloadVoskModel)
+}
+// The generated asset root is an input of merge*Assets. Wait for the
+// download or the APK can ship an empty model.
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
+    dependsOn(copyWakePhrases)
+    dependsOn(downloadVoskModel)
 }
 
 dependencies {
@@ -96,7 +157,7 @@ dependencies {
     implementation("androidx.webkit:webkit:1.12.1")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
-    // WakeModel imports ai.onnxruntime.* (Phase 2 model holder); the
-    // dependency must stay declared or the app does not compile.
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
+    // Offline wake recognizer (Apache-2.0). arm64 only, see ndk.abiFilters.
+    // Replaces onnxruntime: hey_jack.onnx did not detect real speech.
+    implementation("com.alphacephei:vosk-android:0.3.75")
 }

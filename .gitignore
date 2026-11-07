@@ -21,6 +21,9 @@ android/app/src/main/assets/hud/
 # task from wake/*.onnx into assets/wake/). The models in wake/ ARE
 # tracked; the venv used to train them is not.
 android/app/src/main/assets/wake/
+# Desktop wake-test clips and the Vosk model used to score them.
+wake/testdata/
+wake/.vosk-model/
 wake/venv/
 wake/data/
 wake/__pycache__/

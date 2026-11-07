@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -63,6 +64,19 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
         refreshLlmState()
+        val catalog = WakePhrases.load(this)
+        val wakeNow = WakeConfig.current(this, catalog)
+        val phraseBoxes = catalog.choices.map { phrase ->
+            CheckBox(this).apply {
+                text = phrase
+                isChecked = phrase in wakeNow.enabled
+                textSize = 18f
+            }
+        }
+        val confInput = field("Wake confidence 0.50–0.99 (default 0.85)").apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText(String.format(java.util.Locale.US, "%.2f", wakeNow.threshold))
+        }
         val clearLlm = Button(this).apply {
             text = "Clear LLM token (use Mini relay)"
             setOnClickListener {
@@ -105,6 +119,16 @@ class SettingsActivity : AppCompatActivity() {
                     toast("LLM model cannot contain spaces")
                     return@setOnClickListener
                 }
+                val enabledPhrases = phraseBoxes.filter { it.isChecked }.map { it.text.toString() }.toSet()
+                if (enabledPhrases.isEmpty()) {
+                    toast("Leave at least one wake phrase on. Hey Jarvis is not available on this tablet.")
+                    return@setOnClickListener
+                }
+                val wakeConf = confInput.text.toString().toFloatOrNull()
+                if (wakeConf == null || wakeConf < 0.50f || wakeConf > 0.99f) {
+                    toast("Wake confidence must be between 0.50 and 0.99")
+                    return@setOnClickListener
+                }
                 TokenStore.save(this@SettingsActivity, url, token)
                 if (relay.isNotEmpty()) TokenStore.saveVoiceRelayUrl(this@SettingsActivity, relay)
                 TokenStore.saveLlm(
@@ -113,6 +137,7 @@ class SettingsActivity : AppCompatActivity() {
                     llmToken,
                     llmModel.ifEmpty { TokenStore.DEFAULT_LLM_MODEL },
                 )
+                WakeConfig.save(this@SettingsActivity, enabledPhrases, wakeConf)
                 startActivity(
                     Intent(this@SettingsActivity, MainActivity::class.java)
                         .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK),
@@ -151,6 +176,13 @@ class SettingsActivity : AppCompatActivity() {
             addView(llmTokenInput)
             addView(llmState)
             addView(clearLlm)
+            addView(TextView(context).apply {
+                text = "Wake phrases (hey jarvis is never armed)"
+                textSize = 18f
+                setPadding(0, 28, 0, 0)
+            })
+            phraseBoxes.forEach { addView(it) }
+            addView(confInput)
             addView(save)
             addView(note)
         }

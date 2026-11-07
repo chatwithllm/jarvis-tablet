@@ -1,0 +1,30 @@
+{
+  "choices": ["hey jack", "hey tablet", "okay computer"],
+  "defaults": ["hey jack", "hey tablet", "okay computer"],
+  "reject": [
+    "hey jarvis",
+    "hi jarvis",
+    "ok jarvis",
+    "okay jarvis",
+    "hey jackson",
+    "hey jackie",
+    "hey john",
+    "hey jake",
+    "hey james",
+    "hey jacob",
+    "hey jason",
+    "hey zack",
+    "hey mack",
+    "hey hank",
+    "hi jack"
+  ],
+  "includeUnk": true,
+  "confidenceDefault": 0.85,
+  "sampleRate": 16000,
+  "frameSamples": 1280,
+  "preRollMs": 300,
+  "hangMs": 800,
+  "earlyFinalizeMs": 300,
+  "energyFloor": 0.012,
+  "energyMultiplier": 2.5
+}

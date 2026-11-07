@@ -46,7 +46,7 @@ Optional realtime is still not started.
 
 ## What is blocked / pending
 
-### 1. Hey Jack wake word — BLOCKED on human recordings (the big one)
+### 1. Wake word — Vosk grammar (onnx model retired on the tablet)
 - Device tests: no `wake_detected` for real human "Hey Jack" / "Hi Jack" at any
   threshold (0.3–0.9 barely matters). The 0.5-threshold build was tested live
   and still missed both phrases, with no speech-to-text following.
@@ -56,19 +56,16 @@ Optional realtime is still not started.
 - Public datasets were searched and contain nothing usable: LibriSpeech clean
   (5,323 utterances) — 0 hits for "Hey Jack"/"Hi Jack" or any confusable;
   Common Voice not downloadable in a usable form; GigaSpeech gated.
-- **The fix is a retrain on real human recordings.** Exact requirements are in
-  `docs/human-recordings.md` (committed): per speaker, "Hey Jack" ×10 and
-  "Hi Jack" ×10 (5 quiet + 5 noisy each), plus 11 confusables ×3 each
-  ("Hey Jackson", "Hey Jackie", "Hey Jarvis", "Hey John", "Hey Jake",
-  "Hey James", "Hey Jacob", "Hey Jason", "Hey Zack", "Hey Mack", "Hey Hank");
-  minimum 5 speakers (owner + family who use the tablet, kids count);
-  phone Voice Memos is fine, ~5 minutes per person.
-- Once clips arrive: retrain (openWakeWord pipeline, see `wake/`), validate on
-  held-out human voices, ship the new `hey_jack.onnx`, CI build, Developer
-  sideloads and tests. Estimated 1–2 hours of training work once clips land.
-- Tuning reference: `docs/wake-tuning.md` (threshold is runtime-configurable).
-  Do not waste more time on threshold changes — the guide confirms threshold
-  barely matters between 0.3 and 0.9 for this model.
+- **The tablet detector no longer uses `hey_jack.onnx`.** That model does
+  not fire on real speech. Wake detection is a Vosk small en-US grammar
+  (`VoskWakeEngine`): armed phrases default to hey jack, hey tablet, and
+  okay computer; hey jarvis is a reject and must not wake this tablet.
+  Confidence is configurable (default 0.85). On-device WAV inject and the
+  desktop espeak loop are in `docs/wake-vosk-test.md`. Human recordings in
+  `docs/human-recordings.md` are not required for this detector.
+- Do not retrain or ship another `hey_jack.onnx` for this tablet. The
+  owner asked for a recognizer that works without collecting human
+  recordings. `docs/wake-tuning.md` describes the old model only.
 
 ### 2. ContextForge /llm/v1 direct client — BUILT, relay stays the fallback
 - The owner approved Phase 4. This slice is the direct conversation client.
@@ -112,8 +109,8 @@ Optional realtime is still not started.
 
 - `android/app/src/main/java/net/npalakurla/jarvis/tablet/`
   - `MainActivity.kt` — WebView host, bridge wiring, mic permission, battery exemption.
-  - `WakeService.kt` — foreground service, 16 kHz mic loop, openWakeWord pipeline.
-  - `WakeModel.kt` — melspectrogram → embedding → classifier (`hey_jack.onnx`).
+  - `WakeService.kt` — foreground service, 16 kHz mic loop, Vosk wake pipeline.
+  - `VoskWakeEngine.kt` — grammar-restricted Vosk wake (replaces hey_jack.onnx).
   - `VoiceTurn.kt` — turn state machine (idle → recording → thinking → speaking),
     confirm cards (spoken yes or tap, 10 s), quiet-hours volume,
     `RoutingVoiceTransport` / `MiniRelayTransport`.

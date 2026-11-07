@@ -235,7 +235,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
             while (isActive) {
                 HaClient(this@MainActivity).postHeartbeat(
                     wakeState = if (WakeService.isRunning) "running" else "stopped",
-                    modelState = WakeModel.state,
+                    modelState = VoskWakeEngine.state,
                 )
                 delay(60_000)
             }
@@ -249,7 +249,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
             put("ha", TokenStore.hasCredentials(this@MainActivity))
             put("wake", WakeService.isRunning && wakeEnabled)
             put("quiet", isQuietHours())
-            put("mic", WakeModel.state)
+            put("mic", VoskWakeEngine.state)
         }
         bridge.sendEvent("status", payload)
     }

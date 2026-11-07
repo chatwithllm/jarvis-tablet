@@ -101,7 +101,9 @@ jobs:
           for cls in 'Landroidx/appcompat/R$drawable;' 'Lnet/npalakurla/jarvis/tablet/MainActivity;' \
             'Lnet/npalakurla/jarvis/tablet/ContextForgeLlmTransport;' \
             'Lnet/npalakurla/jarvis/tablet/DeviceSpeech;' \
-            'Lnet/npalakurla/jarvis/tablet/RoutingVoiceTransport;'; do
+            'Lnet/npalakurla/jarvis/tablet/RoutingVoiceTransport;' \
+            'Lnet/npalakurla/jarvis/tablet/VoskWakeEngine;' \
+            'Lorg/vosk/Recognizer;'; do
             found=0
             for dex in classes*.dex; do
               if "$dexdump" -f "$dex" 2>/dev/null | grep "Class descriptor" | grep -q -F "$cls"; then found=1; break; fi

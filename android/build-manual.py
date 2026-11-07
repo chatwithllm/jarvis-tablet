@@ -42,8 +42,8 @@ JAVA_HOME = os.environ.get("JAVA_HOME") or os.path.expanduser("~/workspace/.jdk1
 KOTLINC_HOME = os.environ.get("KOTLINC_HOME") or os.path.expanduser("~/workspace/.kotlin/kotlinc")
 
 PACKAGE = "net.npalakurla.jarvis.tablet"
-VERSION_CODE = "2"
-VERSION_NAME = "0.4.0-phase4"
+VERSION_CODE = "3"
+VERSION_NAME = "0.4.1-vosk-wake"
 MIN_SDK = "30"
 TARGET_SDK = "34"
 
@@ -391,7 +391,8 @@ def main():
         "Lnet/npalakurla/jarvis/tablet/RoutingVoiceTransport;",
         "Landroidx/appcompat/app/AppCompatActivity;",
         "Landroidx/webkit/WebViewCompat;",
-        "Lai/onnxruntime/OrtEnvironment;",
+        "Lorg/vosk/Recognizer;",
+        "Lnet/npalakurla/jarvis/tablet/VoskWakeEngine;",
     ]
     defined = set()
     for f in dex_files:
