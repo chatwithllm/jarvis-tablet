@@ -136,7 +136,7 @@ class DeviceSpeech(private val context: Context) {
         tts?.let { return it }
         return withContext(Dispatchers.Main) {
             tts?.let { return@withContext it }
-            suspendCancellableCoroutine { cont ->
+            suspendCancellableCoroutine<TextToSpeech?> { cont ->
                 var engine: TextToSpeech? = null
                 engine = TextToSpeech(context) { status ->
                     val created = engine

@@ -143,7 +143,8 @@ class VoiceTurn(
                 )
             } finally {
                 WakeService.muteTailMs = 0L
-                isActive = false
+                // Inside launch {}, bare isActive is CoroutineScope.isActive (a val).
+                this@VoiceTurn.isActive = false
             }
         }
     }
