@@ -7,4 +7,5 @@
     <item type="id" name="field_llm_model" />
     <item type="id" name="field_llm_token" />
     <item type="id" name="field_wake_confidence" />
+    <item type="id" name="field_tts_voice" />
 </resources>

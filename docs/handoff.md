@@ -70,15 +70,16 @@ Optional realtime is still not started.
 ### 2. ContextForge /llm/v1 direct client — BUILT, relay stays the fallback
 - The owner approved Phase 4. This slice is the direct conversation client.
   Optional realtime is still not started.
-- When the LLM bearer is saved, a tap-to-talk / wake turn uses on-device
-  `SpeechRecognizer` when the device has one, otherwise the bundled Vosk
-  small en-US model in free-form mode (no grammar), then
-  `POST {base}/chat/completions`, then on-device
-  `TextToSpeech`. When that bearer is missing, speech recognition cannot
-  start, or the chat call fails (401/403, unreachable), the turn falls
-  back to the Mini voice relay. A failed direct attempt listens a second
-  time for the relay, because the recognizer already consumed the first
-  utterance and the relay needs WAV audio.
+- When the LLM bearer is saved, a tap-to-talk / wake turn records PCM,
+  sends it to cloud STT (`POST {base}/stt`), then
+  `POST {base}/chat/completions`, then cloud TTS (`POST {base}/tts`,
+  stock voice `leo` by default). Vosk free-form is the STT fallback and
+  Android `TextToSpeech` is the TTS fallback. The ContextForge LLM proxy
+  does not serve `/stt` or `/tts` yet — see `docs/cloud-voice.md`.
+  When that bearer is missing, or cloud STT is unavailable, the turn
+  uses Vosk. If the chat call fails (401/403, unreachable), the turn
+  falls back to the Mini voice relay and listens again, because the
+  relay needs its own WAV.
 - Endpoint (confirmed by the Developer, 2026-11-06 16:27 ET):
   - Base URL default: `http://192.168.20.217:4444/llm/v1` (Settings)
   - Bearer: token name `cf-jarvis-tablet-llm`. File:
