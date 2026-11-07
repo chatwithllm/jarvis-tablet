@@ -118,7 +118,7 @@ object VoskWakeEngine {
         }
     }
 
-    private inner class Session(
+    private class Session(
         private val recognizer: Recognizer,
         val catalog: WakePhrases.Catalog,
     ) {
@@ -146,7 +146,7 @@ object VoskWakeEngine {
 
         fun onFrame(frame: ShortArray, count: Int, settings: WakeConfig.Settings): Hit? {
             if (count <= 0) return null
-            val level = rms(frame, count)
+            val level = frameRms(frame, count)
             val hot = level >= maxOf(noiseFloor * catalog.energyMultiplier, catalog.energyFloor)
             if (!hot && !feeding) {
                 noiseFloor = noiseFloor * 0.98 + level * 0.02
@@ -250,51 +250,6 @@ object VoskWakeEngine {
         }
     }
 
-    /**
-     * A hit is an armed phrase, said in full, with every word at or
-     * above [WakeConfig.Settings.threshold]. Rejects and [unk] are not hits.
-     */
-    internal fun evaluate(json: String, settings: WakeConfig.Settings, rejects: Set<String>): Hit? {
-        val obj = runCatching { JSONObject(json) }.getOrNull() ?: return null
-        val text = normalize(obj.optString("text"))
-        if (text.isEmpty() || text == "[unk]") return null
-        if (text !in settings.enabled || text in rejects || text == "hey jarvis") return null
-        val words = obj.optJSONArray("result") ?: return null
-        if (words.length() == 0) return null
-        var minConf = 1f
-        val spoken = ArrayList<String>(words.length())
-        for (i in 0 until words.length()) {
-            val word = words.optJSONObject(i) ?: return null
-            val conf = word.optDouble("conf", 0.0).toFloat()
-            if (conf < settings.threshold) return null
-            if (conf < minConf) minConf = conf
-            spoken.add(normalize(word.optString("word")))
-        }
-        if (spoken.joinToString(" ") != text) return null
-        return Hit(text, minConf)
-    }
-
-    internal fun normalize(text: String): String =
-        text.lowercase()
-            .replace(Regex("[^a-z\\[\\] ]"), " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-
-    internal fun endingPhrase(text: String, phrases: Collection<String>): String? =
-        phrases.filter { text == it || text.endsWith(" $it") }.maxByOrNull { it.length }
-
-    private fun endsWithAny(text: String, phrases: Collection<String>): Boolean =
-        endingPhrase(text, phrases) != null
-
-    private fun rms(frame: ShortArray, count: Int): Double {
-        var sum = 0.0
-        for (i in 0 until count) {
-            val v = frame[i] / 32768.0
-            sum += v * v
-        }
-        return sqrt(sum / count.coerceAtLeast(1))
-    }
-
     private fun copyAssetDir(context: Context, assetPath: String, dest: File) {
         val kids = context.assets.list(assetPath)
         if (kids == null || kids.isEmpty()) {
@@ -309,4 +264,53 @@ object VoskWakeEngine {
             copyAssetDir(context, "$assetPath/$kid", File(dest, kid))
         }
     }
+}
+
+/**
+ * A hit is an armed phrase, said in full, with every word at or above
+ * the confidence floor. Rejects and [unk] are not hits.
+ */
+private fun evaluate(
+    json: String,
+    settings: WakeConfig.Settings,
+    rejects: Set<String>,
+): VoskWakeEngine.Hit? {
+    val obj = runCatching { JSONObject(json) }.getOrNull() ?: return null
+    val text = normalize(obj.optString("text"))
+    if (text.isEmpty() || text == "[unk]") return null
+    if (text !in settings.enabled || text in rejects || text == "hey jarvis") return null
+    val words = obj.optJSONArray("result") ?: return null
+    if (words.length() == 0) return null
+    var minConf = 1f
+    val spoken = ArrayList<String>(words.length())
+    for (i in 0 until words.length()) {
+        val word = words.optJSONObject(i) ?: return null
+        val conf = word.optDouble("conf", 0.0).toFloat()
+        if (conf < settings.threshold) return null
+        if (conf < minConf) minConf = conf
+        spoken.add(normalize(word.optString("word")))
+    }
+    if (spoken.joinToString(" ") != text) return null
+    return VoskWakeEngine.Hit(text, minConf)
+}
+
+private fun normalize(text: String): String =
+    text.lowercase()
+        .replace(Regex("[^a-z\\[\\] ]"), " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+
+private fun endingPhrase(text: String, phrases: Collection<String>): String? =
+    phrases.filter { text == it || text.endsWith(" $it") }.maxByOrNull { it.length }
+
+private fun endsWithAny(text: String, phrases: Collection<String>): Boolean =
+    endingPhrase(text, phrases) != null
+
+private fun frameRms(frame: ShortArray, count: Int): Double {
+    var sum = 0.0
+    for (i in 0 until count) {
+        val v = frame[i] / 32768.0
+        sum += v * v
+    }
+    return sqrt(sum / count.coerceAtLeast(1))
 }
