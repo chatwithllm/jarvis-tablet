@@ -7,7 +7,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "0.1.0-phase1";
+  var VERSION = "0.4.0-phase4";
   var VIEWS = ["overview", "ha", "pve", "updates", "cams", "bots"];
   var STALE_MS = 5 * 60 * 1000;    // FR-16: stale mark after 5 min
   var OFFLINE_MS = 60 * 60 * 1000; // FR-16: offline badge after 60 min
@@ -62,6 +62,8 @@
   function thinkingText(step) {
     if (step === "voice_phase2_pending") return "Voice arrives in Phase 2 — tap Talk again then.";
     if (step === "cancelled") return "Cancelled.";
+    if (step === "listening") return "Listening…";
+    if (step === "relay_listen") return "Direct voice unavailable. Speak again — using the Mini relay…";
     return "Thinking…";
   }
 

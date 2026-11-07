@@ -65,7 +65,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
         voiceTurn = VoiceTurn(
             this,
             bridge,
-            MiniRelayTransport(this),
+            RoutingVoiceTransport(this),
             isQuietHours = { isQuietHours() },
         )
         // A wake word starts a turn (the HUD event goes out too).
@@ -126,6 +126,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
 
     override fun onDestroy() {
         heartbeatJob?.cancel()
+        if (::voiceTurn.isInitialized) voiceTurn.close()
         super.onDestroy()
     }
 

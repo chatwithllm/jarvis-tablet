@@ -1,0 +1,285 @@
+package net.npalakurla.jarvis.tablet
+
+import android.content.Context
+import android.content.Intent
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.resume
+
+/**
+ * On-device speech for the direct ContextForge path.
+ *
+ * The Mini relay does Whisper + Piper. This path uses the tablet's
+ * [SpeechRecognizer] and [TextToSpeech] instead, so a turn does not
+ * need the Mini unless the LLM call fails and [VoiceTurn] falls back.
+ * [SpeechRecognizer] owns the microphone for the listen (the wake
+ * service yields first). Audio is not stored and not logged.
+ *
+ * `EXTRA_PREFER_OFFLINE` is left unset on purpose: on Android 11 the
+ * flag forces a failure when no offline pack is installed. The platform
+ * recognizer (on-device when the tablet has one) is the accepted STT.
+ */
+class DeviceSpeech(private val context: Context) {
+
+    data class ListenResult(val transcript: String?, val error: String?)
+
+    @Volatile private var tts: TextToSpeech? = null
+
+    /**
+     * @param manageWakeMic when true (the default), the wake service's
+     * recorder is released for this listen and started again afterwards.
+     * A confirm window that listens more than once passes false and
+     * pauses the wake mic itself, so it is not restarted between phrases.
+     */
+    suspend fun listen(
+        timeoutMs: Long = 12_000,
+        onPartial: (String) -> Unit = {},
+        onLevel: (Double) -> Unit = {},
+        manageWakeMic: Boolean = true,
+    ): ListenResult {
+        // Release the wake service's AudioRecord first. A second open
+        // from the recognition service fails on some Android 11 devices
+        // while that recorder is held.
+        if (manageWakeMic) WakeService.pauseMic()
+        try {
+            return withContext(Dispatchers.Main) {
+                val available = runCatching {
+                    SpeechRecognizer.isRecognitionAvailable(context)
+                }.getOrDefault(false)
+                if (!available) ListenResult(null, "recognizer_unavailable")
+                else listenOnMain(timeoutMs, onPartial, onLevel)
+            }
+        } finally {
+            if (manageWakeMic) WakeService.resumeMic()
+        }
+    }
+
+    /** True = yes, false = no, null = not a confirm phrase (or nothing heard). */
+    suspend fun listenYesNo(timeoutMs: Long, manageWakeMic: Boolean = true): Boolean? {
+        val heard = listen(timeoutMs = timeoutMs, manageWakeMic = manageWakeMic)
+        val text = heard.transcript ?: return null
+        return interpretConfirm(text)
+    }
+
+    /**
+     * Speak [text] at [volume] (1 = full, 0.2 = quiet hours, FR-26).
+     * Returns when the utterance finishes, the engine errors, or 25 s
+     * passes. A missing engine is not a turn failure — the HUD already
+     * shows the text.
+     */
+    suspend fun speak(text: String, volume: Float) {
+        val spoken = text.trim()
+        if (spoken.isEmpty()) return
+        val engine = ensureEngine() ?: return
+        withContext(Dispatchers.Main) {
+            suspendCancellableCoroutine { cont ->
+                val id = "jarvis-${System.nanoTime()}"
+                val handler = Handler(Looper.getMainLooper())
+                val finished = AtomicBoolean(false)
+                fun finish() {
+                    if (!finished.compareAndSet(false, true)) return
+                    handler.removeCallbacksAndMessages(null)
+                    if (cont.isActive) cont.resume(Unit)
+                }
+                cont.invokeOnCancellation {
+                    handler.removeCallbacksAndMessages(null)
+                    runCatching { engine.stop() }
+                }
+                handler.postDelayed({
+                    runCatching { engine.stop() }
+                    finish()
+                }, 25_000)
+                engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) {}
+                    override fun onDone(utteranceId: String?) {
+                        if (utteranceId == id) finish()
+                    }
+                    override fun onError(utteranceId: String?) {
+                        finish()
+                    }
+                    override fun onError(utteranceId: String?, errorCode: Int) {
+                        finish()
+                    }
+                })
+                val params = Bundle().apply {
+                    putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, volume.coerceIn(0f, 1f))
+                }
+                val code = runCatching {
+                    engine.speak(spoken, TextToSpeech.QUEUE_FLUSH, params, id)
+                }.getOrDefault(TextToSpeech.ERROR)
+                if (code == TextToSpeech.ERROR) finish()
+            }
+        }
+    }
+
+    fun shutdown() {
+        val engine = tts
+        tts = null
+        val main = Handler(Looper.getMainLooper())
+        main.post { runCatching { engine?.shutdown() } }
+    }
+
+    private suspend fun ensureEngine(): TextToSpeech? {
+        tts?.let { return it }
+        return withContext(Dispatchers.Main) {
+            tts?.let { return@withContext it }
+            suspendCancellableCoroutine { cont ->
+                var engine: TextToSpeech? = null
+                engine = TextToSpeech(context) { status ->
+                    val created = engine
+                    if (status == TextToSpeech.SUCCESS && created != null) {
+                        created.language = Locale.US
+                        created.setAudioAttributes(
+                            android.media.AudioAttributes.Builder()
+                                .setUsage(android.media.AudioAttributes.USAGE_ASSISTANT)
+                                .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .build(),
+                        )
+                        tts = created
+                        if (cont.isActive) cont.resume(created)
+                    } else {
+                        runCatching { created?.shutdown() }
+                        Log.w(TAG, "tts init failed")
+                        if (cont.isActive) cont.resume(null)
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun listenOnMain(
+        timeoutMs: Long,
+        onPartial: (String) -> Unit,
+        onLevel: (Double) -> Unit,
+    ): ListenResult = suspendCancellableCoroutine { cont ->
+        val recognizer = SpeechRecognizer.createSpeechRecognizer(context)
+        val handler = Handler(Looper.getMainLooper())
+        val finished = AtomicBoolean(false)
+        val lastPartial = AtomicReference<String?>(null)
+        fun destroy() {
+            handler.removeCallbacksAndMessages(null)
+            val drop = {
+                runCatching { recognizer.cancel() }
+                runCatching { recognizer.destroy() }
+            }
+            if (Looper.myLooper() == Looper.getMainLooper()) drop() else handler.post { drop() }
+        }
+        fun finish(text: String?, error: String?) {
+            if (!finished.compareAndSet(false, true)) return
+            destroy()
+            if (cont.isActive) {
+                cont.resume(ListenResult(text?.trim()?.ifEmpty { null }, error))
+            }
+        }
+        handler.postDelayed({
+            val partial = lastPartial.get()?.trim().orEmpty()
+            if (partial.isNotEmpty()) finish(partial, null) else finish(null, "timeout")
+        }, timeoutMs)
+        cont.invokeOnCancellation {
+            if (finished.compareAndSet(false, true)) destroy()
+        }
+        recognizer.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle) {}
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(rmsdB: Float) {
+                // Recognizer RMS is about -2..10 dB. Map into the HUD's 0..1 level.
+                val level = ((rmsdB + 2f) / 12f).toDouble().coerceIn(0.0, 1.0)
+                runCatching { onLevel(level) }
+            }
+            override fun onBufferReceived(buffer: ByteArray?) {
+                // Format is undocumented and often empty. Never log it, never keep it.
+            }
+            override fun onEndOfSpeech() {}
+            override fun onError(error: Int) {
+                val partial = lastPartial.get()?.trim().orEmpty()
+                if (partial.isNotEmpty()) finish(partial, null)
+                else finish(null, sttErrorName(error))
+            }
+            override fun onResults(results: Bundle) {
+                val text = results
+                    .getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull()
+                finish(text, null)
+            }
+            override fun onPartialResults(partialResults: Bundle) {
+                val text = partialResults
+                    .getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull()
+                    ?.trim()
+                    .orEmpty()
+                if (text.isEmpty()) return
+                lastPartial.set(text)
+                runCatching { onPartial(text) }
+            }
+            override fun onEvent(eventType: Int, params: Bundle) {}
+        })
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1_500L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1_500L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 400L)
+        }
+        runCatching { recognizer.startListening(intent) }
+            .onFailure {
+                Log.w(TAG, "startListening failed: ${it.javaClass.simpleName}")
+                finish(null, "client")
+            }
+    }
+
+    companion object {
+        private const val TAG = "DeviceSpeech"
+
+        internal fun sttErrorName(code: Int): String = when (code) {
+            SpeechRecognizer.ERROR_AUDIO -> "audio"
+            SpeechRecognizer.ERROR_CLIENT -> "client"
+            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "permissions"
+            SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "network"
+            SpeechRecognizer.ERROR_NO_MATCH -> "no_match"
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "busy"
+            SpeechRecognizer.ERROR_SERVER -> "server"
+            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "speech_timeout"
+            else -> "stt_$code"
+        }
+    }
+}
+
+/**
+ * Spoken confirm (FR-24). A short yes/no only — a longer sentence is
+ * ignored so ambient speech cannot confirm a change. Null = not a decision.
+ */
+internal fun interpretConfirm(transcript: String): Boolean? {
+    val cleaned = transcript.lowercase()
+        .replace(Regex("[^a-z' ]"), " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+    if (cleaned.isEmpty()) return null
+    val words = cleaned.split(' ')
+    if (words.size > 4) return null
+    if (cleaned in NO_PHRASES) return false
+    if (cleaned in YES_PHRASES) return true
+    val first = words.first().trim('\'')
+    if (first in NO_WORDS) return false
+    if (first in YES_WORDS) return true
+    return null
+}
+
+private val YES_WORDS = setOf("yes", "yeah", "yep", "yup", "ok", "okay", "confirm", "sure")
+private val NO_WORDS = setOf("no", "nope", "nah", "cancel", "stop", "don't", "dont")
+private val YES_PHRASES = setOf("do it", "go ahead", "yes please", "ok do it")
+private val NO_PHRASES = setOf("do not", "no thanks", "no thank you")
