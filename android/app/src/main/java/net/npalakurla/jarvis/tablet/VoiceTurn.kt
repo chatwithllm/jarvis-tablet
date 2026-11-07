@@ -393,7 +393,7 @@ class VoiceTurn(
             bridge.sendEvent("tts_finished", JSONObject())
             return RelayAttempt.Silent
         }
-        val heard = wavToPcm(audio)?.let { VoskWakeEngine.transcribe(context, it) }
+        val heard = wavToPcm(audio)?.let { pcm16leToShorts(it) }?.let { VoskWakeEngine.transcribe(context, it) }
         if (SafetyGate.block(heard)) {
             showRefused()
             return RelayAttempt.Refused
@@ -758,6 +758,19 @@ class VoiceTurn(
     }
 
     /** Extract the PCM payload from a WAV (find the "data" chunk). */
+    private fun pcm16leToShorts(pcm: ByteArray): ShortArray {
+        val n = pcm.size / 2
+        val out = ShortArray(n)
+        var i = 0
+        while (i < n) {
+            val lo = pcm[i * 2].toInt() and 0xFF
+            val hi = pcm[i * 2 + 1].toInt()
+            out[i] = ((hi shl 8) or lo).toShort()
+            i++
+        }
+        return out
+    }
+
     private fun wavToPcm(wav: ByteArray): ByteArray? {
         var i = 0
         while (i + 8 <= wav.size) {
