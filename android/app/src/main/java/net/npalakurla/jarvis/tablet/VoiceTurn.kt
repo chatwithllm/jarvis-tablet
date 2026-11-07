@@ -9,6 +9,7 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.util.Base64
 import android.util.Log
+import java.io.File
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -149,6 +150,65 @@ class VoiceTurn(
         }
     }
 
+    /**
+     * Debug path: run one full turn from a 16 kHz mono WAV instead of
+     * the microphone. The relay accepts that audio. A saved LLM token
+     * still falls through to the relay here, because this build cannot
+     * speech-recognize a file on Android 11.
+     */
+    fun startFromWav(path: String?) {
+        Log.i(VOICE, "debug_wav")
+        if (isActive) {
+            Log.i(VOICE, "result=busy")
+            return
+        }
+        val file = path?.let { File(it) }
+        if (file == null || !file.isFile || DebugWake.decodeWav(file) == null) {
+            Log.i(VOICE, "result=bad_wav")
+            bridge.sendEvent(
+                "error",
+                JSONObject().put("code", "voice_failed").put("message", "That WAV could not be used."),
+            )
+            return
+        }
+        val wav = file.readBytes()
+        isActive = true
+        bridge.sendEvent("thinking", JSONObject().put("step", "listening"))
+        WakeService.muteTailMs = TURN_MUTE_MS
+        turnJob = scope.launch {
+            try {
+                // A file has no on-device transcript on Android 11, so the
+                // WAV turn always uses the relay. A live tap still tries
+                // /llm/v1 first when that token is saved.
+                Log.i(VOICE, "path=relay")
+                val result = transport.runTurn(wav)
+                val value = result.getOrElse {
+                    Log.i(VOICE, "result=error")
+                    bridge.sendEvent(
+                        "error",
+                        JSONObject()
+                            .put("code", "ha_unreachable")
+                            .put("message", "Could not reach the voice relay. Check the Mini."),
+                    )
+                    return@launch
+                }
+                Log.i(VOICE, "result=ok")
+                present(value)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.i(VOICE, "result=error")
+                bridge.sendEvent(
+                    "error",
+                    JSONObject().put("code", "voice_failed").put("message", "Voice turn failed. Try again."),
+                )
+            } finally {
+                WakeService.muteTailMs = 0L
+                this@VoiceTurn.isActive = false
+            }
+        }
+    }
+
     /** Cancel the current turn (orb tapped while listening, or Back). */
     fun cancel() {
         recording = false
@@ -180,9 +240,13 @@ class VoiceTurn(
     private suspend fun runTurn() {
         bridge.sendEvent("thinking", JSONObject().put("step", "listening"))
         if (!transport.preferDirect()) {
+            Log.i(VOICE, "path=relay")
+            Log.i(VOICE, "mic_start")
             finishRelay(relayTurn(announce = false), directError = null)
             return
         }
+        Log.i(VOICE, "path=direct")
+        Log.i(VOICE, "mic_start")
         val heard = try {
             deviceSpeech.listen(
                 onPartial = { text ->
@@ -203,26 +267,41 @@ class VoiceTurn(
             bridge.sendEvent("thinking", JSONObject().put("step", "transcribing"))
             val direct = transport.completeText(transcript)
             if (direct.isSuccess) {
+                Log.i(VOICE, "result=ok")
                 present(direct.getOrThrow())
                 return
             }
-            Log.w(TAG, "direct llm failed: ${direct.exceptionOrNull()?.message}")
-            finishRelay(relayTurn(announce = true), direct.exceptionOrNull())
+            val failure = direct.exceptionOrNull()
+            val http = (failure as? LlmCallFailed)?.http ?: 0
+            Log.w(TAG, "direct llm failed: ${failure?.message}")
+            // 401/403 (and any other direct failure) continues on the
+            // Mini relay instead of ending the turn on the error.
+            if (http == 401 || http == 403) {
+                Log.i(VOICE, "result=llm_auth")
+            }
+            Log.i(VOICE, "path=relay")
+            Log.i(VOICE, "mic_start")
+            finishRelay(relayTurn(announce = true), failure)
             return
         }
         if (isSilence(heard.error)) {
             // Recognizer ran and nobody spoke. Don't open a second listen.
+            Log.i(VOICE, "result=silent")
             bridge.sendEvent("tts_finished", JSONObject())
             return
         }
         Log.w(TAG, "direct stt failed: ${heard.error}")
+        Log.i(VOICE, "path=relay")
+        Log.i(VOICE, "mic_start")
         finishRelay(relayTurn(announce = true), IllegalStateException("stt ${heard.error}"))
     }
 
     private suspend fun finishRelay(attempt: RelayAttempt, directError: Throwable?) {
         when (attempt) {
-            RelayAttempt.Presented, RelayAttempt.Silent -> Unit
+            RelayAttempt.Presented -> Log.i(VOICE, "result=ok")
+            RelayAttempt.Silent -> Log.i(VOICE, "result=silent")
             RelayAttempt.Unconfigured -> {
+                Log.i(VOICE, "result=error")
                 bridge.sendEvent(
                     "error",
                     JSONObject()
@@ -231,6 +310,7 @@ class VoiceTurn(
                 )
             }
             is RelayAttempt.Failed -> {
+                Log.i(VOICE, "result=error")
                 Log.w(TAG, "relay failed: ${attempt.error.message}")
                 bridge.sendEvent(
                     "error",
@@ -276,7 +356,6 @@ class VoiceTurn(
      * failure, so the person knows to speak again.
      */
     private suspend fun relayTurn(announce: Boolean): RelayAttempt {
-        if (TokenStore.getVoiceRelayUrl(context) == null) return RelayAttempt.Unconfigured
         if (announce) {
             bridge.sendEvent("thinking", JSONObject().put("step", "relay_listen"))
         }
@@ -645,6 +724,7 @@ class VoiceTurn(
 
     companion object {
         private const val TAG = "VoiceTurn"
+        private const val VOICE = "JarvisVoice"
         const val SAMPLE_RATE = 16_000
         const val FRAME_SAMPLES = 1_280 // 80 ms @ 16 kHz
         const val FRAME_MS = 80L
@@ -669,7 +749,6 @@ class MiniRelayTransport(private val context: Context) : VoiceTurn.Transport {
         kotlinx.coroutines.withContext(Dispatchers.IO) {
             runCatching {
                 val base = TokenStore.getVoiceRelayUrl(context)
-                    ?: throw IllegalStateException("Voice relay not configured (Settings)")
                 val conn = URL("$base/voice/turn").openConnection() as HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.setRequestProperty("Content-Type", "audio/wav")
@@ -709,7 +788,6 @@ class MiniRelayTransport(private val context: Context) : VoiceTurn.Transport {
         kotlinx.coroutines.withContext(Dispatchers.IO) {
             runCatching {
                 val base = TokenStore.getVoiceRelayUrl(context)
-                    ?: throw IllegalStateException("Voice relay not configured (Settings)")
                 val conn = URL("$base/voice/execute").openConnection() as HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.setRequestProperty("Content-Type", "application/json")

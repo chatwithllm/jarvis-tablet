@@ -68,11 +68,13 @@ html, body { height: 100%; background: var(--bg); color: var(--text);
 .hidden { display: none !important; }
 
 /* FR-13 bottom dock, 120 px; orb 88 px */
-#dock { height: 120px; display: flex; align-items: center; gap: 16px;
+#dock { height: 144px; display: flex; align-items: center; gap: 16px;
   padding: 0 24px; border-top: 1px solid var(--cyan-dim); }
 #dock button { min-width: 110px; }
-#orb-wrap { position: relative; width: 88px; height: 88px; margin: 0 8px; }
-#orb { width: 88px; height: 88px; border-radius: 50%; border: 2px solid var(--cyan);
+#settings-gear { min-width: 72px; font-size: 32px; padding: 8px 12px; }
+#hud-clock { cursor: pointer; }
+#orb-wrap { position: relative; width: 120px; height: 120px; margin: 0 8px; }
+#orb { width: 120px; height: 120px; border-radius: 50%; border: 2px solid var(--cyan);
   background: radial-gradient(circle, rgba(0,229,255,0.35), rgba(0,229,255,0.05));
   color: var(--cyan); font-size: 28px; cursor: pointer; min-width: 0; padding: 0; }
 #orb.listening { background: radial-gradient(circle, rgba(0,229,255,0.8), rgba(0,229,255,0.2)); color: #001318; }

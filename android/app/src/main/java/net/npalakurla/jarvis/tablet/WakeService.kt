@@ -60,7 +60,10 @@ class WakeService : Service() {
             ContextCompat.registerReceiver(
                 this,
                 receiver,
-                IntentFilter(DebugWakeReceiver.ACTION),
+                IntentFilter().apply {
+                    addAction(DebugWakeReceiver.ACTION)
+                    addAction(VoiceDebug.ACTION)
+                },
                 ContextCompat.RECEIVER_EXPORTED,
             )
         }

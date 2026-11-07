@@ -358,8 +358,14 @@ object TokenStore {
     const val DEFAULT_CF_URL =
         "http://192.168.20.217:4444/servers/a1345fe8da0d4971bd35621e294baed3/mcp"
 
-    /** Default Mini voice relay (mini/voice-relay.py, LAN only). Set in Settings when deployed. */
-    const val DEFAULT_VOICE_RELAY_URL = ""
+    /**
+     * Mini voice relay on the LAN. Used when the LLM bearer is missing
+     * and when /llm/v1 returns 401 or 403. Settings can replace it.
+     */
+    const val DEFAULT_VOICE_RELAY_URL = "http://192.168.20.217:8793"
+
+    /** Shown in Settings instead of the real bearer. Never stored. */
+    const val SAVED_TOKEN_MASK = "saved"
 
     /**
      * ContextForge OpenAI-compatible base (LAN). The chat call is
@@ -390,16 +396,29 @@ object TokenStore {
     fun getCfToken(context: Context): String? =
         runCatching { prefs(context).getString(KEY_TOKEN, null) }.getOrNull()
 
-    /** Mini voice relay base URL (Phase 2), or null when not configured. */
-    fun getVoiceRelayUrl(context: Context): String? =
+    /**
+     * Mini voice relay base URL. A blank stored value uses
+     * [DEFAULT_VOICE_RELAY_URL] so a turn with no LLM token still has
+     * a relay to call.
+     */
+    fun getVoiceRelayUrl(context: Context): String =
         runCatching { prefs(context).getString(KEY_VOICE_RELAY, null) }
             .getOrNull()?.trim()?.trimEnd('/')?.ifEmpty { null }
+            ?: DEFAULT_VOICE_RELAY_URL
 
+    /**
+     * Save the MCP URL. A blank token, or the mask [SAVED_TOKEN_MASK],
+     * keeps the bearer already stored. The real token is never written
+     * back from the Settings field unless the person typed a new one.
+     */
     fun save(context: Context, cfUrl: String, cfToken: String) {
-        prefs(context).edit()
+        val edit = prefs(context).edit()
             .putString(KEY_URL, cfUrl.trim().trimEnd('/'))
-            .putString(KEY_TOKEN, cfToken.trim())
-            .apply()
+        val token = cfToken.trim()
+        if (token.isNotEmpty() && !token.equals(SAVED_TOKEN_MASK, ignoreCase = true)) {
+            edit.putString(KEY_TOKEN, token)
+        }
+        edit.apply()
     }
 
     fun saveVoiceRelayUrl(context: Context, url: String) {
@@ -435,7 +454,10 @@ object TokenStore {
         val edit = prefs(context).edit()
             .putString(KEY_LLM_URL, baseUrl.trim().trimEnd('/').ifEmpty { DEFAULT_LLM_URL })
             .putString(KEY_LLM_MODEL, model.trim().ifEmpty { DEFAULT_LLM_MODEL })
-        if (token.isNotBlank()) edit.putString(KEY_LLM_TOKEN, token.trim())
+        val llmToken = token.trim()
+        if (llmToken.isNotEmpty() && !llmToken.equals(SAVED_TOKEN_MASK, ignoreCase = true)) {
+            edit.putString(KEY_LLM_TOKEN, llmToken)
+        }
         edit.commit()
     }
 

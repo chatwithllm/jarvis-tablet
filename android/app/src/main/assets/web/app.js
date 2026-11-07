@@ -7,7 +7,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "0.4.0-phase4";
+  var VERSION = "0.4.2-settings-voice";
   var VIEWS = ["overview", "ha", "pve", "updates", "cams", "bots"];
   var STALE_MS = 5 * 60 * 1000;    // FR-16: stale mark after 5 min
   var OFFLINE_MS = 60 * 60 * 1000; // FR-16: offline badge after 60 min
@@ -42,7 +42,10 @@
       else if (type === "listening_level") { pulseOrb(p.level || 0); }
       else if (type === "transcript_partial") { setTranscript(p.text || ""); }
       else if (type === "transcript_final") { setTranscript(p.text || ""); }
-      else if (type === "thinking") { setTranscript(thinkingText(p.step)); }
+      else if (type === "thinking") {
+        setTranscript(thinkingText(p.step));
+        if (p.step === "listening" || p.step === "relay_listen") setListening(true);
+      }
       else if (type === "tts_started") { setTranscript(p.text || ""); }
       else if (type === "tts_finished") { setListening(false); }
       else if (type === "confirm_requested") { showConfirm(p); }
@@ -274,7 +277,7 @@
       showView(b.getAttribute("data-dock"));
     });
   });
-  $("orb").addEventListener("click", function () {
+  function onTalk() {
     if (state.listening) {
       // Cancel the turn — or the pending confirm when one is showing.
       send("cancel", state.confirmId ? { id: state.confirmId } : {});
@@ -282,8 +285,31 @@
     } else {
       send("talk_pressed", {});
       setListening(true);
+      setTranscript("Listening…");
     }
+  }
+  // The wrap is the hit target so a tap on the ring still starts a turn.
+  $("orb-wrap").addEventListener("click", onTalk);
+  function openSettings() { send("open_settings", {}); }
+  $("settings-gear").addEventListener("click", function (e) {
+    e.stopPropagation();
+    openSettings();
   });
+  function bindLongPress(el) {
+    if (!el) return;
+    var timer = null;
+    el.addEventListener("touchstart", function () {
+      timer = setTimeout(openSettings, 600);
+    }, { passive: true });
+    el.addEventListener("touchend", function () { clearTimeout(timer); });
+    el.addEventListener("touchmove", function () { clearTimeout(timer); });
+    el.addEventListener("contextmenu", function (e) {
+      e.preventDefault();
+      openSettings();
+    });
+  }
+  bindLongPress($("hud-clock"));
+  bindLongPress($("banner"));
   $("confirm-yes").addEventListener("click", function () {
     if (state.confirmId) send("confirm_yes", { id: state.confirmId });
     hideConfirm();

@@ -19,12 +19,15 @@ import java.io.FileInputStream
 class DebugWakeReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
         if (!BuildConfig.DEBUG) return
-        if (intent?.action != ACTION) return
+        val action = intent?.action ?: return
         val path = intent.getStringExtra("path")
         val pending = goAsync()
         Thread({
             try {
-                WakeService.debugWav(context.applicationContext, path)
+                when (action) {
+                    ACTION -> WakeService.debugWav(context.applicationContext, path)
+                    VoiceDebug.ACTION -> VoiceDebug.dispatch(path)
+                }
             } finally {
                 pending.finish()
             }
@@ -33,6 +36,22 @@ class DebugWakeReceiver : BroadcastReceiver() {
 
     companion object {
         const val ACTION = "net.npalakurla.jarvis.tablet.DEBUG_WAKE_WAV"
+    }
+}
+
+/** Debug-only full voice turn from a WAV. MainActivity installs [handler]. */
+object VoiceDebug {
+    const val ACTION = "net.npalakurla.jarvis.tablet.DEBUG_TURN_WAV"
+
+    @Volatile var handler: ((String?) -> Unit)? = null
+
+    fun dispatch(path: String?) {
+        val turn = handler
+        if (turn == null) {
+            android.util.Log.i("JarvisVoice", "result=no_activity")
+        } else {
+            turn(path)
+        }
     }
 }
 

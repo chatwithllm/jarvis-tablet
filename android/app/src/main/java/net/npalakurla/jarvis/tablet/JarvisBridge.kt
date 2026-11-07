@@ -1,5 +1,6 @@
 package net.npalakurla.jarvis.tablet
 
+import android.util.Log
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import org.json.JSONObject
@@ -33,6 +34,7 @@ class JarvisBridge(
 
     interface Host {
         fun onTalkPressed()
+        fun onOpenSettings()
         fun onConfirmYes(id: String)
         fun onConfirmNo(id: String)
         /** Cancel the current turn, or the pending confirm when id is given. */
@@ -48,7 +50,11 @@ class JarvisBridge(
         runCatching {
             val msg = JSONObject(json)
             when (msg.optString("type")) {
-                "talk_pressed" -> host.onTalkPressed()
+                "talk_pressed" -> {
+                    Log.i("JarvisVoice", "tap")
+                    host.onTalkPressed()
+                }
+                "open_settings" -> host.onOpenSettings()
                 "confirm_yes" -> host.onConfirmYes(msg.optString("id"))
                 "confirm_no" -> host.onConfirmNo(msg.optString("id"))
                 "cancel" -> host.onCancel(msg.optString("id").ifEmpty { null })

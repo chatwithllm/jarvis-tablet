@@ -71,6 +71,20 @@ wake_none
 `wake_wav_error ...` means the file was missing or not 16 kHz mono 16-bit,
 and is followed by `wake_none`. The receiver exists only in debug builds.
 
+Settings (debug builds): a gear on the dock, or a long-press on the clock.
+`adb shell am start -n net.npalakurla.jarvis.tablet/.SettingsActivity`
+opens Settings without retyping a saved token (the field shows `saved`).
+
+A full voice turn from a WAV, with no microphone, logs `JarvisVoice`:
+
+```bash
+adb shell am broadcast -a net.npalakurla.jarvis.tablet.DEBUG_TURN_WAV \
+  --es path "$DEST/x.wav"
+adb logcat -d -s JarvisVoice:I
+```
+
+`path=relay` is used when the LLM token is missing and when `/llm/v1` returns 401 or 403.
+
 If the broadcast is dropped, add the package:
 
 ```bash

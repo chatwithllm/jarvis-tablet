@@ -28,7 +28,7 @@
 
     <main id="content">
       <section id="view-overview" class="view active">
-        <div class="hud-clock"><span id="clock">--:--</span><span id="date"></span></div>
+        <div class="hud-clock" id="hud-clock"><span id="clock">--:--</span><span id="date"></span></div>
         <div id="overview-cards" class="cards"></div>
       </section>
       <section id="view-ha" class="view"><h2>Home Assistant</h2><div id="ha-cards" class="cards"></div></section>
@@ -62,8 +62,9 @@
     <button data-dock="cams">Cams</button>
     <button data-dock="bots">Bots</button>
     <button data-dock="updates">Updates</button>
+    <button id="settings-gear" aria-label="Settings" type="button">⚙</button>
     <div id="orb-wrap">
-      <button id="orb" aria-label="Talk">●</button>
+      <button id="orb" aria-label="Talk" type="button">●</button>
       <div id="orb-ring"></div>
     </div>
     <span id="status-line"><span id="ha-dot" class="dot off"></span><span id="status-text">Connecting…</span></span>

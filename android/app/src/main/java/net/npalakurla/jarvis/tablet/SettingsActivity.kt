@@ -35,12 +35,15 @@ class SettingsActivity : AppCompatActivity() {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             setText(TokenStore.getCfUrl(this@SettingsActivity) ?: TokenStore.DEFAULT_CF_URL)
         }
-        val tokenInput = field("ContextForge MCP bearer (cf-jarvis-tablet)").apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        val tokenSaved = TokenStore.getCfToken(this) != null
+        val tokenInput = field(
+            if (tokenSaved) "ContextForge MCP bearer — saved" else "ContextForge MCP bearer (cf-jarvis-tablet)",
+        ).apply {
+            if (tokenSaved) setText(TokenStore.SAVED_TOKEN_MASK)
         }
         val relayInput = field("Voice relay URL (Mini) — optional, used as fallback").apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            setText(TokenStore.getVoiceRelayUrl(this@SettingsActivity) ?: "")
+            setText(TokenStore.getVoiceRelayUrl(this@SettingsActivity))
         }
         val llmUrlInput = field("LLM base URL (ContextForge /llm/v1)").apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
@@ -49,8 +52,11 @@ class SettingsActivity : AppCompatActivity() {
         val llmModelInput = field("LLM model (default grok-4.7)").apply {
             setText(TokenStore.getLlmModel(this@SettingsActivity))
         }
-        val llmTokenInput = field("LLM bearer (cf-jarvis-tablet-llm) — leave blank to keep").apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        val llmSaved = TokenStore.hasLlmCredentials(this)
+        val llmTokenInput = field(
+            if (llmSaved) "LLM bearer — saved" else "LLM bearer (cf-jarvis-tablet-llm)",
+        ).apply {
+            if (llmSaved) setText(TokenStore.SAVED_TOKEN_MASK)
         }
         val llmState = TextView(this).apply {
             textSize = 16f
@@ -103,7 +109,8 @@ class SettingsActivity : AppCompatActivity() {
                     toast("URL must start with http:// or https://")
                     return@setOnClickListener
                 }
-                if (token.isEmpty()) {
+                val keepMcp = token.isEmpty() || token.equals(TokenStore.SAVED_TOKEN_MASK, ignoreCase = true)
+                if (keepMcp && TokenStore.getCfToken(this@SettingsActivity) == null) {
                     toast("Paste the tablet MCP bearer issued by IT Admin")
                     return@setOnClickListener
                 }
@@ -151,7 +158,8 @@ class SettingsActivity : AppCompatActivity() {
                 "ContextForge. The LLM bearer (cf-jarvis-tablet-llm) is a different token — " +
                 "the MCP one is rejected on /llm/v1. No raw Home Assistant token is ever " +
                 "typed here or stored on the tablet. Nothing here goes in the WebView or the repo. " +
-                "Leave the LLM bearer blank to keep the saved one. Clear it to force the Mini relay."
+                "A field that says saved already has a token — leave it to keep that token. " +
+                "Clear the LLM bearer to force the Mini relay."
             gravity = Gravity.CENTER
             setPadding(0, 24, 0, 0)
         }
