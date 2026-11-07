@@ -146,7 +146,7 @@ class WakeService : Service() {
         const val FRAME_SAMPLES = 1_280 // 80 ms @ 16 kHz (PRD voice stack)
 
         /** Runtime tunables (Phase 2 tuning week): threshold + mute tail. */
-        @Volatile var threshold: Float = 0.7f
+        @Volatile var threshold: Float = 0.5f
         @Volatile var muteTailMs: Long = 0L // FR-29: 0 ms default
 
         @Volatile var isRunning: Boolean = false
