@@ -83,9 +83,9 @@ class SettingsActivity : AppCompatActivity() {
         }
         fun refreshLlmState() {
             llmState.text = if (TokenStore.hasLlmCredentials(this)) {
-                "LLM token: saved. Voice tries ContextForge directly; the Mini relay is the fallback."
+                "LLM token: saved. One turn speaks with xAI, or the text stays on screen."
             } else {
-                "LLM token: not set. Voice uses the Mini relay."
+                "LLM token: not set. A voice turn is not sent."
             }
         }
         refreshLlmState()

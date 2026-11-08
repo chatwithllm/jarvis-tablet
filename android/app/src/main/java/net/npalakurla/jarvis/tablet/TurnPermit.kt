@@ -1,8 +1,9 @@
 package net.npalakurla.jarvis.tablet
 
 /**
- * Authorizes at most one chat-or-relay call and one cloud TTS for a
- * single intentional turn.
+ * Authorizes one turn to ask for chat and one cloud TTS.
+ * The chat client itself may post at most [LeanChat.MAX_POSTS]
+ * completions. This permit is not that HTTP count.
  *
  * [tryBegin] is the only way to become eligible. Ambient audio, a
  * rejected phrase, and a second callback do not get a token. [revoke]

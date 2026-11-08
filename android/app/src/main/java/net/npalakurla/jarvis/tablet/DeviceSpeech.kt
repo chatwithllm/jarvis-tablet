@@ -156,20 +156,21 @@ class DeviceSpeech(private val context: Context) {
      * passes. A missing engine is not a turn failure — the HUD already
      * shows the text.
      */
-    suspend fun speak(text: String, volume: Float, cloud: Boolean = true) {
+    /**
+     * Speak with xAI only. Returns false when that audio is missing.
+     * Android speech is not used.
+     */
+    suspend fun speak(text: String, volume: Float, cloud: Boolean = true): Boolean {
         val spoken = text.trim()
-        if (spoken.isEmpty()) return
-        if (cloud && TokenStore.hasLlmCredentials(context)) {
-            val audio = withContext(Dispatchers.IO) { CloudVoice.synthesize(context, spoken) }
-            val played = audio != null && audio.isNotEmpty() &&
-                runCatching { withTimeout(30_000) { playMp3(audio, volume) } }.getOrDefault(false)
-            if (played) {
-                Log.i("JarvisVoice", "tts=cloud")
-                return
-            }
-        }
-        Log.i("JarvisVoice", "tts=android")
-        speakAndroid(spoken, volume)
+        if (spoken.isEmpty() || !cloud) return false
+        if (!TokenStore.hasLlmCredentials(context)) return false
+        val started = System.nanoTime()
+        val audio = withContext(Dispatchers.IO) { CloudVoice.synthesize(context, spoken) }
+        val ttsMs = (System.nanoTime() - started) / 1_000_000L
+        val played = audio != null && audio.isNotEmpty() &&
+            runCatching { withTimeout(30_000) { playMp3(audio, volume) } }.getOrDefault(false)
+        Log.i("JarvisVoice", if (played) "tts=cloud tts_ms=$ttsMs" else "tts=unavailable tts_ms=$ttsMs")
+        return played
     }
 
     private suspend fun playMp3(bytes: ByteArray, volume: Float): Boolean =

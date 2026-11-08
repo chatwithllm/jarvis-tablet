@@ -181,7 +181,6 @@ class VoiceTurn(
             Log.i(VOICE, "result=busy")
             return
         }
-        val wav = file.readBytes()
         isActive = true
         bridge.sendEvent("thinking", JSONObject().put("step", "listening"))
         WakeService.muteTailMs = TURN_MUTE_MS
@@ -198,6 +197,15 @@ class VoiceTurn(
                     if (heard.isNullOrBlank()) {
                         Log.i(VOICE, "result=silent")
                         bridge.sendEvent("tts_finished", JSONObject())
+                        return@launch
+                    }
+                    val grounded = groundedReply(heard, token)
+                    if (grounded != null) {
+                        Log.i(VOICE, "path=grounded")
+                        present(
+                            TurnResult(heard, grounded, ttsAudio = null, proposedAction = null),
+                            token,
+                        )
                         return@launch
                     }
                     if (!permit.allowChat(token)) {
@@ -219,24 +227,13 @@ class VoiceTurn(
                     )
                     return@launch
                 }
-                Log.i(VOICE, "path=relay")
-                if (!permit.allowChat(token)) {
-                    Log.i(VOICE, "result=revoked")
-                    return@launch
-                }
-                val result = transport.runTurn(wav)
-                val value = result.getOrElse {
-                    Log.i(VOICE, "result=error")
-                    bridge.sendEvent(
-                        "error",
-                        JSONObject()
-                            .put("code", "ha_unreachable")
-                            .put("message", "Could not reach the voice relay. Check the Mini."),
-                    )
-                    return@launch
-                }
-                Log.i(VOICE, "result=ok")
-                present(value, token)
+                Log.i(VOICE, "result=unavailable")
+                bridge.sendEvent(
+                    "error",
+                    JSONObject()
+                        .put("code", "voice_unavailable")
+                        .put("message", "Debug relay turns are not sent."),
+                )
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -291,9 +288,13 @@ class VoiceTurn(
     private suspend fun runTurn(token: Long) {
         bridge.sendEvent("thinking", JSONObject().put("step", "listening"))
         if (!transport.preferDirect()) {
-            Log.i(VOICE, "path=relay")
-            Log.i(VOICE, "mic_start")
-            finishRelay(relayTurn(announce = false, token = token), directError = null)
+            Log.i(VOICE, "result=unavailable")
+            bridge.sendEvent(
+                "error",
+                JSONObject()
+                    .put("code", "voice_unavailable")
+                    .put("message", "Voice needs the ContextForge token. Nothing was sent."),
+            )
             return
         }
         Log.i(VOICE, "path=direct")
@@ -317,6 +318,15 @@ class VoiceTurn(
         if (transcript.isNotEmpty()) {
             if (SafetyGate.block(transcript)) {
                 showRefused()
+                return
+            }
+            val grounded = groundedReply(transcript, token)
+            if (grounded != null) {
+                Log.i(VOICE, "path=grounded")
+                present(
+                    TurnResult(transcript, grounded, ttsAudio = null, proposedAction = null),
+                    token,
+                )
                 return
             }
             if (!permit.allowChat(token)) {
@@ -445,6 +455,20 @@ class VoiceTurn(
         return RelayAttempt.Presented
     }
 
+    private fun groundedReply(transcript: String, token: Long): String? {
+        if (!permit.isCurrent(token)) return null
+        return SpokenFacts.localReply(
+            transcript,
+            java.time.ZonedDateTime.now(java.time.ZoneId.of(SpokenFacts.ZONE)),
+        ) {
+            if (!permit.isCurrent(token)) {
+                null
+            } else {
+                HaClient(context).readToolBlocking("ha-get-states").getOrNull()
+            }
+        }
+    }
+
     /** Local Vosk only. Cloud STT is not deployed and is not called. */
     private fun transcribeWav(pcm: ShortArray): String? {
         Log.i(VOICE, "stt=vosk")
@@ -480,8 +504,7 @@ class VoiceTurn(
         }
         // Piper audio is the model's reply. After a no / refusal / failed
         // execute, don't play it — it may claim the change already happened.
-        val wav = if (outcome == null || outcome == "confirmed") result.ttsAudio else null
-        speakResponse(text, wav, token)
+        speakResponse(text, token)
     }
 
     /**
@@ -655,26 +678,29 @@ class VoiceTurn(
         }
     }
 
-    private suspend fun speakResponse(text: String, wav: ByteArray?, token: Long) {
+    private suspend fun speakResponse(text: String, token: Long) {
         val trimmed = text.trim()
-        if (trimmed.isEmpty() && wav == null) {
+        if (trimmed.isEmpty()) {
             bridge.sendEvent("tts_finished", JSONObject())
             return
         }
         bridge.sendEvent("tts_started", JSONObject().put("text", trimmed))
-        try {
-            if (wav != null) {
-                playPcm(wav)
-            } else {
-                // FR-26: quiet hours 21:00-07:00 at 20% volume.
-                deviceSpeech.speak(
-                    trimmed.take(600),
-                    if (isQuietHours()) 0.2f else 1.0f,
-                    cloud = permit.allowTts(token),
-                )
-            }
+        val played = try {
+            deviceSpeech.speak(
+                trimmed.take(600),
+                if (isQuietHours()) 0.2f else 1.0f,
+                cloud = permit.allowTts(token),
+            )
         } finally {
             bridge.sendEvent("tts_finished", JSONObject())
+        }
+        if (!played) {
+            bridge.sendEvent(
+                "error",
+                JSONObject()
+                    .put("code", "tts_unavailable")
+                    .put("message", "$trimmed Voice audio is unavailable."),
+            )
         }
     }
 
