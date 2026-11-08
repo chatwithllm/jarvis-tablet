@@ -172,7 +172,12 @@ class DeviceSpeech(private val context: Context) {
             Log.i("JarvisVoice", "tts=unavailable")
             return false
         }
-        val played = runCatching { withTimeout(30_000) { playMp3(audio, volume) } }.getOrDefault(false)
+        WakeService.beginOwnAudio()
+        val played = try {
+            runCatching { withTimeout(30_000) { playMp3(audio, volume) } }.getOrDefault(false)
+        } finally {
+            WakeService.endOwnAudio()
+        }
         Log.i("JarvisVoice", if (played) "tts=cloud" else "tts=unavailable")
         return played
     }

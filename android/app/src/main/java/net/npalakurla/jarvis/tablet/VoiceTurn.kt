@@ -57,6 +57,7 @@ class VoiceTurn(
     private val isQuietHours: () -> Boolean,
     private val permit: TurnPermit = TurnPermit(),
 ) {
+    private val weatherRead = WeatherRead()
 
     /** One turn's result from the relay or the direct client. */
     data class TurnResult(
@@ -457,16 +458,45 @@ class VoiceTurn(
 
     private fun groundedReply(transcript: String, token: Long): String? {
         if (!permit.isCurrent(token)) return null
-        return SpokenFacts.localReply(
-            transcript,
-            java.time.ZonedDateTime.now(java.time.ZoneId.of(SpokenFacts.ZONE)),
-        ) {
-            if (!permit.isCurrent(token)) {
-                null
-            } else {
-                HaClient(context).readToolBlocking("ha-get-states").getOrNull()
-            }
+        val now = java.time.ZonedDateTime.now(java.time.ZoneId.of(SpokenFacts.ZONE))
+        if (SpokenFacts.isTimeQuestion(transcript)) {
+            val sentence = SpokenFacts.timeSentence(now)
+            Log.i(
+                VOICE,
+                "time_source=device_clock zone=${SpokenFacts.ZONE} answer=$sentence",
+            )
+            return sentence
         }
+        if (!SpokenFacts.isWeatherQuestion(transcript)) return null
+        if (!permit.isCurrent(token)) return null
+        val outcome = weatherRead.load(
+            now.toInstant(),
+            readOne = { id ->
+                if (!permit.isCurrent(token)) {
+                    null
+                } else {
+                    HaClient(context).readToolBlocking(
+                        "ha-get-state",
+                        org.json.JSONObject().put("entity_id", id),
+                    ).getOrNull()
+                }
+            },
+            readAll = {
+                if (!permit.isCurrent(token)) {
+                    null
+                } else {
+                    HaClient(context).readToolBlocking("ha-get-states").getOrNull()
+                }
+            },
+        )
+        val detail = outcome.detail
+        Log.i(
+            VOICE,
+            "weather_tool=${outcome.tool} weather_ms=${outcome.millis} " +
+                "entity=${detail.entityId ?: "none"} observed=${detail.observed ?: "none"} " +
+                "age_s=${detail.ageSeconds ?: -1} fresh=${detail.fresh} answer=${detail.sentence}",
+        )
+        return detail.sentence
     }
 
     /** Local Vosk only. Cloud STT is not deployed and is not called. */

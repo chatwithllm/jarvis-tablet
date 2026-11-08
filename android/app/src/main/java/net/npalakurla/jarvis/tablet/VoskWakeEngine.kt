@@ -60,6 +60,7 @@ object VoskWakeEngine {
                 val recognizer = Recognizer(voskModel, loaded.sampleRate.toFloat(), WakePhrases.grammarJson(loaded))
                 recognizer.setWords(true)
                 recognizer.setPartialWords(true)
+                recognizer.setMaxAlternatives(3)
                 session = Session(recognizer, loaded)
                 state = "ready"
                 true
@@ -126,12 +127,9 @@ object VoskWakeEngine {
                 if (!ensureReady(context)) return null
                 val voskModel = model ?: return null
                 val rate = (catalog?.sampleRate ?: 16_000).toFloat()
-                // Bias the small model toward time and weather before free-form.
-                // [unk] stays in that grammar so other commands are not forced
-                // into those phrases. A miss still uses the free-form text.
+                val free = recognize(voskModel, rate, null, pcm)
                 val biased = recognize(voskModel, rate, SpokenFacts.intentGrammarJson(), pcm)
-                SpokenFacts.fromGrammar(biased)?.let { return it }
-                return recognize(voskModel, rate, null, pcm)
+                return SpokenFacts.chooseTranscript(free, biased)
             }
         } finally {
             injecting = false
@@ -167,6 +165,11 @@ object VoskWakeEngine {
     private fun collectText(json: String, parts: MutableList<String>) {
         val text = runCatching { JSONObject(json).optString("text") }.getOrDefault("").trim()
         if (text.isNotEmpty()) parts.add(text)
+    }
+
+    /** Drop a partial or pre-roll so later audio cannot finish an old phrase. */
+    fun discardHeardAudio() {
+        synchronized(lock) { session?.reset() }
     }
 
     fun close() {
@@ -337,22 +340,35 @@ private fun evaluate(
     rejects: Set<String>,
 ): VoskWakeEngine.Hit? {
     val obj = runCatching { JSONObject(json) }.getOrNull() ?: return null
-    val text = normalize(obj.optString("text"))
+    val altArr = obj.optJSONArray("alternatives")
+    val source = if (altArr != null && altArr.length() > 0) altArr.optJSONObject(0) ?: obj else obj
+    val alternatives = ArrayList<String>()
+    if (altArr != null) {
+        for (i in 0 until altArr.length()) {
+            alternatives.add(altArr.optJSONObject(i)?.optString("text").orEmpty())
+        }
+    }
+    val text = normalize(source.optString("text").ifEmpty { obj.optString("text") })
     if (text.isEmpty() || text == "[unk]") return null
     if (text !in settings.enabled || text in rejects || text == "hey jarvis") return null
-    val words = obj.optJSONArray("result") ?: return null
+    val words = source.optJSONArray("result") ?: obj.optJSONArray("result") ?: return null
     if (words.length() == 0) return null
-    val spoken = ArrayList<String>(words.length())
-    val confs = ArrayList<Float>(words.length())
+    val spans = ArrayList<WakeGate.Word>(words.length())
     for (i in 0 until words.length()) {
         val word = words.optJSONObject(i) ?: return null
-        spoken.add(normalize(word.optString("word")))
-        confs.add(word.optDouble("conf", 0.0).toFloat())
+        spans.add(
+            WakeGate.Word(
+                word = normalize(word.optString("word")),
+                startSec = word.optDouble("start", Double.NaN),
+                endSec = word.optDouble("end", Double.NaN),
+                conf = word.optDouble("conf", 0.0).toFloat(),
+            ),
+        )
     }
-    if (spoken.joinToString(" ") != text) return null
-    if (!WakeAccept.accept(text, confs, settings.threshold)) return null
-    if (text !in settings.enabled || text in rejects) return null
-    return VoskWakeEngine.Hit(text, confs.minOrNull() ?: return null)
+    if (spans.joinToString(" ") { it.word } != text) return null
+    val hypothesis = WakeGate.Hypothesis(text, spans, alternatives)
+    if (!WakeGate.genuine(hypothesis, settings.threshold)) return null
+    return VoskWakeEngine.Hit(text, spans.minOf { it.conf })
 }
 
 private fun normalize(text: String): String =

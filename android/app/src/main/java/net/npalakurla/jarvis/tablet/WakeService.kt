@@ -112,6 +112,7 @@ class WakeService : Service() {
             recorder = null
             worker = null
             micYielded = true
+            resetRequested = true
         }
     }
 
@@ -120,6 +121,7 @@ class WakeService : Service() {
             if (!micYielded) return
             micYielded = false
             if (!isRunning) return
+            resetRequested = true
             startMicLoop()
         }
     }
@@ -183,9 +185,13 @@ class WakeService : Service() {
                     JSONObject().put("level", level),
                 )
                 val now = System.currentTimeMillis()
-                if (now < mutedUntilMs || now < suppressUntilMs) continue
+                if (resetRequested) {
+                    resetRequested = false
+                    VoskWakeEngine.discardHeardAudio()
+                }
+                if (now < mutedUntilMs || now < suppressUntilMs || now < ownAudioUntilMs) continue
                 val hit = VoskWakeEngine.onMicrophoneFrame(app, frame, read) ?: continue
-                mutedUntilMs = now + muteTailMs
+                mutedUntilMs = now + maxOf(muteTailMs, WakeGate.RING_MS)
                 WakeLog.detected(hit.phrase, hit.conf)
                 listener?.sendEvent(
                     "wake_detected",
@@ -219,8 +225,24 @@ class WakeService : Service() {
         /** Drop frames until this clock time so a turn and its echo cannot re-wake. */
         @Volatile var suppressUntilMs: Long = 0L
 
+        /** Our own playback, plus a short ring. Not a conversation cooldown. */
+        @Volatile var ownAudioUntilMs: Long = 0L
+
+        @Volatile var resetRequested: Boolean = false
+
         fun suppressScoring(durationMs: Long) {
+            resetRequested = true
             suppressUntilMs = System.currentTimeMillis() + durationMs.coerceAtLeast(0L)
+        }
+
+        fun beginOwnAudio() {
+            resetRequested = true
+            ownAudioUntilMs = Long.MAX_VALUE / 4
+        }
+
+        fun endOwnAudio() {
+            resetRequested = true
+            ownAudioUntilMs = System.currentTimeMillis() + WakeGate.RING_MS
         }
 
         @Volatile var isRunning: Boolean = false

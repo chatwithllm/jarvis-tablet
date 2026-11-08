@@ -11,8 +11,9 @@ package net.npalakurla.jarvis.tablet
  * makes that token unable to start a later call. A call already inside
  * the HTTP client is not killed from here.
  *
- * After the turn finishes, a spoken wake is ignored until the echo
- * hold passes. An explicit Talk tap is not held back by that echo.
+ * After our own playback, a spoken wake waits out a short speaker
+ * ring. An explicit Talk tap is not held back. Room speech is not
+ * blocked for the rest of the conversation.
  */
 class TurnPermit(
     private val clock: () -> Long = { System.currentTimeMillis() },
@@ -73,6 +74,6 @@ class TurnPermit(
     }
 
     companion object {
-        const val ECHO_HOLD_MS = 4_000L
+        const val ECHO_HOLD_MS = WakeGate.RING_MS
     }
 }

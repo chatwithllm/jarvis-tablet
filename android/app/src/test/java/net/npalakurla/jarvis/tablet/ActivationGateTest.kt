@@ -106,13 +106,13 @@ class ActivationGateTest {
         val upstream = Upstream()
         val permit = TurnPermit(clock = { now })
         spend(permit, TurnPermit.Source.WAKE, "hey tablet", upstream)
-        now = 1_500L
+        now = 1_100L
         assertNull(spend(permit, TurnPermit.Source.WAKE, "hey tablet", upstream))
         assertEquals(1, upstream.chat)
         val talk = spend(permit, TurnPermit.Source.TALK, "hey tablet", upstream)
         assertTrue(talk != null)
         assertEquals(2, upstream.chat)
-        now = 1_500L + TurnPermit.ECHO_HOLD_MS
+        now = 1_100L + TurnPermit.ECHO_HOLD_MS
         val again = spend(permit, TurnPermit.Source.WAKE, "hey tablet", upstream)
         assertTrue(again != null)
         assertEquals(3, upstream.chat)

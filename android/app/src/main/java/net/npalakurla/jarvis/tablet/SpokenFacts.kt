@@ -79,6 +79,19 @@ internal object SpokenFacts {
         return null
     }
 
+    /**
+     * Free-form text wins when it is already a real sentence. The intent
+     * grammar may supply time or weather only when free-form is empty or
+     * [unk]. It must not replace unrelated speech.
+     */
+    fun chooseTranscript(free: String?, grammar: String?): String? {
+        val freeText = free?.trim().orEmpty()
+        if (isTimeQuestion(freeText) || isWeatherQuestion(freeText)) return freeText
+        val guided = fromGrammar(grammar)
+        if (guided != null && (freeText.isEmpty() || normalize(freeText) == "unk")) return guided
+        return freeText.ifEmpty { null }
+    }
+
     fun intentGrammarJson(): String {
         val arr = org.json.JSONArray()
         INTENT_PHRASES.forEach { arr.put(it) }
@@ -105,16 +118,32 @@ internal object SpokenFacts {
         return "It is $clock in $ZONE."
     }
 
-    fun weatherSentence(payload: String?, now: Instant, maxAge: Duration = MAX_WEATHER_AGE): String {
-        val entity = freshestWeather(payload) ?: return UNAVAILABLE
-        val observed = entity.observed ?: return UNAVAILABLE
-        val age = Duration.between(observed, now)
-        if (age.isNegative || age > maxAge) return UNAVAILABLE
-        if (entity.condition.isBlank() || entity.temperature == null) return UNAVAILABLE
+    data class WeatherDetail(
+        val sentence: String,
+        val entityId: String?,
+        val observed: Instant?,
+        val ageSeconds: Long?,
+        val fresh: Boolean,
+    )
+
+    fun weatherSentence(payload: String?, now: Instant, maxAge: Duration = MAX_WEATHER_AGE): String =
+        weatherDetail(payload, now, maxAge).sentence
+
+    fun weatherDetail(payload: String?, now: Instant, maxAge: Duration = MAX_WEATHER_AGE): WeatherDetail {
+        val entity = freshestWeather(payload)
+            ?: return WeatherDetail(UNAVAILABLE, null, null, null, false)
+        val observed = entity.observed
+        val age = observed?.let { Duration.between(it, now) }
+        val fresh = observed != null && age != null && !age.isNegative && age <= maxAge &&
+            entity.condition.isNotBlank() && entity.temperature != null
+        if (!fresh) {
+            return WeatherDetail(UNAVAILABLE, entity.id, observed, age?.seconds, false)
+        }
         val whenSeen = DateTimeFormatter.ofPattern("h:mm a", Locale.US)
-            .format(observed.atZone(ZoneId.of(ZONE)))
+            .format(observed!!.atZone(ZoneId.of(ZONE)))
         val unit = entity.unit?.let { " $it" }.orEmpty()
-        return "${entity.id} is ${entity.temperature}$unit and ${entity.condition}, observed at $whenSeen in $ZONE."
+        val sentence = "${entity.id} is ${entity.temperature}$unit and ${entity.condition}, observed at $whenSeen in $ZONE."
+        return WeatherDetail(sentence, entity.id, observed, age!!.seconds, true)
     }
 
     private data class Reading(
@@ -157,7 +186,9 @@ internal object SpokenFacts {
         }
         return when (value) {
             is JSONArray -> value
-            is JSONObject -> value.optJSONArray("states") ?: value.optJSONArray("result")
+            is JSONObject ->
+                if (value.has("entity_id")) JSONArray().put(value)
+                else value.optJSONArray("states") ?: value.optJSONArray("result")
             else -> null
         }
     }
