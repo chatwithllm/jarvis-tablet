@@ -126,28 +126,41 @@ object VoskWakeEngine {
                 if (!ensureReady(context)) return null
                 val voskModel = model ?: return null
                 val rate = (catalog?.sampleRate ?: 16_000).toFloat()
-                val recognizer = Recognizer(voskModel, rate)
-                try {
-                    recognizer.setWords(true)
-                    val parts = ArrayList<String>()
-                    var offset = 0
-                    while (offset < pcm.size) {
-                        val n = minOf(4_000, pcm.size - offset)
-                        val slice = ShortArray(n)
-                        System.arraycopy(pcm, offset, slice, 0, n)
-                        if (recognizer.acceptWaveForm(slice, n)) {
-                            collectText(recognizer.result, parts)
-                        }
-                        offset += n
-                    }
-                    collectText(recognizer.finalResult, parts)
-                    return parts.joinToString(" ").trim().ifEmpty { null }
-                } finally {
-                    runCatching { recognizer.close() }
-                }
+                // Bias the small model toward time and weather before free-form.
+                // [unk] stays in that grammar so other commands are not forced
+                // into those phrases. A miss still uses the free-form text.
+                val biased = recognize(voskModel, rate, SpokenFacts.intentGrammarJson(), pcm)
+                SpokenFacts.fromGrammar(biased)?.let { return it }
+                return recognize(voskModel, rate, null, pcm)
             }
         } finally {
             injecting = false
+        }
+    }
+
+    private fun recognize(voskModel: Model, rate: Float, grammar: String?, pcm: ShortArray): String? {
+        val recognizer = if (grammar == null) {
+            Recognizer(voskModel, rate)
+        } else {
+            Recognizer(voskModel, rate, grammar)
+        }
+        try {
+            recognizer.setWords(true)
+            val parts = ArrayList<String>()
+            var offset = 0
+            while (offset < pcm.size) {
+                val n = minOf(4_000, pcm.size - offset)
+                val slice = ShortArray(n)
+                System.arraycopy(pcm, offset, slice, 0, n)
+                if (recognizer.acceptWaveForm(slice, n)) {
+                    collectText(recognizer.result, parts)
+                }
+                offset += n
+            }
+            collectText(recognizer.finalResult, parts)
+            return parts.joinToString(" ").trim().ifEmpty { null }
+        } finally {
+            runCatching { recognizer.close() }
         }
     }
 

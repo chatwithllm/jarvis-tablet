@@ -51,6 +51,8 @@ object WakePhrases {
         val defaults = stringList(json, "defaults").filter { it in choices }.toSet()
         // hey jarvis stays a reject even if a phrases.json edit lists it
         // as a choice. Another household device owns that wake word.
+        // Short fragments such as "hey tab" are not in the grammar: on
+        // v10 they competed with "hey tablet" and dropped espeak hits.
         val rejects = stringList(json, "reject").toSet() + "hey jarvis"
         val safeChoices = choices.filter { it != "hey jarvis" && it !in rejects }
         return Catalog(
@@ -83,9 +85,8 @@ object WakePhrases {
         choices = listOf(WakeAccept.PHRASE),
         defaults = setOf(WakeAccept.PHRASE),
         rejects = setOf(
-            "okay computer", "ok computer", "hey computer", "hey jack",
+            "okay computer", "hey jack",
             "hey jarvis", "hi jarvis", "ok jarvis", "okay jarvis",
-            "hi tablet", "okay tablet", "hey tab",
             "hey jackson", "hey jackie", "hey john", "hey jake",
             "hey james", "hey jacob", "hey jason", "hey zack",
             "hey mack", "hey hank", "hi jack",

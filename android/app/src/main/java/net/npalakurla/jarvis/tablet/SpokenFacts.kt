@@ -28,7 +28,19 @@ internal object SpokenFacts {
     private val WEATHER = Regex(
         """\b(weather|temperature|forecast|raining|rainy|humidity|humid)\b""",
     )
-    private val COMMAND = Regex("""\b(turn on|turn off|toggle|switch)\b""")
+    private val COMMAND = Regex("""\b(turn on|turn off|toggle|switch|open|close|lock|unlock|dim|set)\b""")
+    private val HOME = Regex(
+        """\b(light|lights|lamp|door|garage|alarm|switch|fan|thermostat|heat|cover|blind|tv|television|music|kitchen|bedroom|meeting|appointment|calendar|timer)\b""",
+    )
+    /** Phrases the intent grammar may return. [unk] means "not this". */
+    val INTENT_PHRASES = listOf(
+        "what time is it",
+        "what is the time",
+        "tell me the time",
+        "current time",
+        "what is the weather",
+        "how is the weather",
+    )
 
     fun normalize(text: String): String =
         text.lowercase(Locale.US)
@@ -36,13 +48,46 @@ internal object SpokenFacts {
             .replace(Regex("\\s+"), " ")
             .trim()
 
-    fun isTimeQuestion(text: String): Boolean = TIME.matches(normalize(text))
+    fun isTimeQuestion(text: String): Boolean {
+        val spoken = normalize(text)
+        if (TIME.matches(spoken)) return true
+        if (blocked(spoken)) return false
+        val tokens = spoken.split(" ").filter { it.isNotEmpty() }
+        // Free-form Vosk has returned "that time in it" for "what time is it".
+        if (tokens.size !in 2..6 || "time" !in tokens) return false
+        return "what" in tokens || "that" in tokens || "whats" in tokens || "tell" in tokens
+    }
 
     fun isWeatherQuestion(text: String): Boolean {
         val spoken = normalize(text)
-        if (COMMAND.containsMatchIn(spoken)) return false
-        return WEATHER.containsMatchIn(spoken)
+        if (blocked(spoken)) return false
+        if (WEATHER.containsMatchIn(spoken)) return true
+        val tokens = spoken.split(" ").filter { it.isNotEmpty() }
+        // Free-form Vosk has returned "is that where the" for "what's the weather".
+        if (tokens.size !in 3..6 || "where" !in tokens) return false
+        return "that" in tokens || "what" in tokens || "whats" in tokens
     }
+
+    /**
+     * Grammar result to keep, or null when the utterance should stay on
+     * the free-form transcript. [unk] is not an intent.
+     */
+    fun fromGrammar(text: String?): String? {
+        val spoken = normalize(text.orEmpty())
+        if (spoken.isEmpty() || spoken == "unk") return null
+        if (isTimeQuestion(spoken) || isWeatherQuestion(spoken)) return spoken
+        return null
+    }
+
+    fun intentGrammarJson(): String {
+        val arr = org.json.JSONArray()
+        INTENT_PHRASES.forEach { arr.put(it) }
+        arr.put("[unk]")
+        return arr.toString()
+    }
+
+    private fun blocked(spoken: String): Boolean =
+        COMMAND.containsMatchIn(spoken) || HOME.containsMatchIn(spoken)
 
     /**
      * A sentence to speak and show, or null when the transcript should

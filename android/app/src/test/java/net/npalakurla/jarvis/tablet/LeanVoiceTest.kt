@@ -90,6 +90,63 @@ class LeanVoiceTest {
     }
 
     @Test
+    fun vosk_mishearings_match_time_or_weather_and_not_other_requests() {
+        val timeHeard = listOf(
+            "what time is it",
+            "what time in it",
+            "that time in it",
+            "what time is it now",
+            "what time did it out",
+        )
+        val weatherHeard = listOf(
+            "what's the weather",
+            "what is that where the",
+            "what's that where the",
+            "is that where the",
+            "what is the weather like",
+            "what is that where weather like",
+            "what is that weather like",
+        )
+        val neither = listOf(
+            "they'll be a short fun fact",
+            "tell me your phone",
+            "gave me a fun fact",
+            "turn on the kitchen light",
+            "lock the front door",
+            "open the garage",
+            "what time is the meeting",
+            "where is the kitchen light",
+        )
+        val now = ZonedDateTime.of(2026, 11, 8, 21, 41, 0, 0, ZoneId.of(SpokenFacts.ZONE))
+        timeHeard.forEach { heard ->
+            assertTrue(heard, SpokenFacts.isTimeQuestion(heard))
+            assertFalse(heard, SpokenFacts.isWeatherQuestion(heard))
+            var states = 0
+            val reply = SpokenFacts.localReply(heard, now) {
+                states += 1
+                null
+            }
+            assertEquals("It is 9:41 PM in America/New_York.", reply)
+            assertEquals(0, states)
+        }
+        weatherHeard.forEach { heard ->
+            assertTrue(heard, SpokenFacts.isWeatherQuestion(heard))
+            assertFalse(heard, SpokenFacts.isTimeQuestion(heard))
+        }
+        neither.forEach { heard ->
+            assertFalse(heard, SpokenFacts.isTimeQuestion(heard))
+            assertFalse(heard, SpokenFacts.isWeatherQuestion(heard))
+            assertNull(SpokenFacts.localReply(heard, now) { "[]" })
+        }
+        assertNull(SpokenFacts.fromGrammar("[unk]"))
+        assertNull(SpokenFacts.fromGrammar("turn on the kitchen light"))
+        assertEquals("what time is it", SpokenFacts.fromGrammar("what time is it"))
+        assertTrue(SpokenFacts.intentGrammarJson().contains("[unk]"))
+        assertTrue(SpokenFacts.intentGrammarJson().contains("what time is it"))
+        assertTrue(SpokenFacts.intentGrammarJson().contains("what is the weather"))
+    }
+
+    @Test
     fun time_uses_the_clock_and_does_not_ask_for_states_or_chat() {
         val now = ZonedDateTime.of(2026, 11, 8, 21, 41, 0, 0, ZoneId.of(SpokenFacts.ZONE))
         var states = 0

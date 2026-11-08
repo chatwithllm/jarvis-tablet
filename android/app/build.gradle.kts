@@ -14,8 +14,8 @@ android {
         applicationId = "net.npalakurla.jarvis.tablet"
         minSdk = 30 // Lenovo TB-J606F runs Android 11 (API 30)
         targetSdk = 34
-        versionCode = 10
-        versionName = "0.4.8-lean-voice"
+        versionCode = 11
+        versionName = "0.4.10-intent"
         // TB-J606F is arm64. Dropping the other ABIs keeps Vosk (and any
         // leftover native deps) from shipping three extra copies of libvosk.
         ndk {

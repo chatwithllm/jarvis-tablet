@@ -164,30 +164,54 @@ class DeviceSpeech(private val context: Context) {
         val spoken = text.trim()
         if (spoken.isEmpty() || !cloud) return false
         if (!TokenStore.hasLlmCredentials(context)) return false
-        val started = System.nanoTime()
+        val startedNs = System.nanoTime()
         val audio = withContext(Dispatchers.IO) { CloudVoice.synthesize(context, spoken) }
-        val ttsMs = (System.nanoTime() - started) / 1_000_000L
-        val played = audio != null && audio.isNotEmpty() &&
-            runCatching { withTimeout(30_000) { playMp3(audio, volume) } }.getOrDefault(false)
-        Log.i("JarvisVoice", if (played) "tts=cloud tts_ms=$ttsMs" else "tts=unavailable tts_ms=$ttsMs")
+        val ttsMs = (System.nanoTime() - startedNs) / 1_000_000L
+        Log.i("JarvisVoice", "tts_ms=$ttsMs")
+        if (audio == null || audio.isEmpty()) {
+            Log.i("JarvisVoice", "tts=unavailable")
+            return false
+        }
+        val played = runCatching { withTimeout(30_000) { playMp3(audio, volume) } }.getOrDefault(false)
+        Log.i("JarvisVoice", if (played) "tts=cloud" else "tts=unavailable")
         return played
     }
 
-    private suspend fun playMp3(bytes: ByteArray, volume: Float): Boolean =
-        withContext(Dispatchers.IO) {
-            val file = java.io.File.createTempFile("jarvis-tts", ".mp3", context.cacheDir)
-            try {
-                file.writeBytes(bytes)
+    /**
+     * Play on the main looper. Release is posted after the callback
+     * returns so the player is not destroyed while its event is still
+     * being delivered.
+     */
+    private suspend fun playMp3(bytes: ByteArray, volume: Float): Boolean {
+        val file = withContext(Dispatchers.IO) {
+            java.io.File.createTempFile("jarvis-tts", ".mp3", context.cacheDir).also {
+                it.writeBytes(bytes)
+            }
+        }
+        return try {
+            withContext(Dispatchers.Main) {
                 suspendCancellableCoroutine { cont ->
                     val player = android.media.MediaPlayer()
-                    fun finish(ok: Boolean) {
-                        runCatching { player.release() }
-                        runCatching { file.delete() }
+                    val handler = Handler(Looper.getMainLooper())
+                    val finished = AtomicBoolean(false)
+                    fun releaseAfterCallback() {
+                        handler.post {
+                            runCatching { player.reset() }
+                            runCatching { player.release() }
+                            runCatching { file.delete() }
+                        }
+                    }
+                    fun finish(ok: Boolean, marker: String) {
+                        if (!finished.compareAndSet(false, true)) return
+                        Log.i("JarvisVoice", marker)
+                        releaseAfterCallback()
                         if (cont.isActive) cont.resume(ok)
                     }
                     cont.invokeOnCancellation {
-                        runCatching { player.release() }
-                        runCatching { file.delete() }
+                        if (finished.compareAndSet(false, true)) {
+                            Log.i("JarvisVoice", "tts_play_cancel")
+                            releaseAfterCallback()
+                        }
                     }
                     player.setAudioAttributes(
                         android.media.AudioAttributes.Builder()
@@ -195,25 +219,33 @@ class DeviceSpeech(private val context: Context) {
                             .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
                             .build(),
                     )
-                    player.setOnCompletionListener { finish(true) }
-                    player.setOnErrorListener { _, _, _ ->
-                        finish(false)
+                    player.setOnPreparedListener {
+                        val startedOk = runCatching {
+                            val level = volume.coerceIn(0f, 1f)
+                            player.setVolume(level, level)
+                            player.start()
+                        }
+                        if (startedOk.isFailure) finish(false, "tts_play_error")
+                        else Log.i("JarvisVoice", "tts_play_start")
+                    }
+                    player.setOnCompletionListener { finish(true, "tts_play_complete") }
+                    player.setOnErrorListener { _, what, extra ->
+                        finish(false, "tts_play_error what=$what extra=$extra")
                         true
                     }
-                    val started = runCatching {
+                    val queued = runCatching {
                         player.setDataSource(file.absolutePath)
-                        val level = volume.coerceIn(0f, 1f)
-                        player.setVolume(level, level)
-                        player.prepare()
-                        player.start()
+                        player.prepareAsync()
                     }
-                    if (started.isFailure) finish(false)
+                    if (queued.isFailure) finish(false, "tts_play_error")
                 }
-            } catch (e: Exception) {
-                runCatching { file.delete() }
-                false
             }
+        } catch (e: Exception) {
+            runCatching { file.delete() }
+            Log.i("JarvisVoice", "tts_play_error")
+            false
         }
+    }
 
     private suspend fun speakAndroid(spoken: String, volume: Float) {
         val engine = ensureEngine() ?: return

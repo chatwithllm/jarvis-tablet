@@ -271,6 +271,7 @@ class ContextForgeLlmTransport(private val context: Context) {
             }
         }
         val conn = URL(url).openConnection() as HttpURLConnection
+        val started = System.nanoTime()
         return try {
             conn.requestMethod = "POST"
             // Do not follow redirects: that would send the LLM bearer to another host.
@@ -281,13 +282,13 @@ class ContextForgeLlmTransport(private val context: Context) {
             conn.connectTimeout = 10_000
             conn.readTimeout = 20_000
             conn.doOutput = true
-            val started = System.nanoTime()
             conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
             val chatMs = (System.nanoTime() - started) / 1_000_000L
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             // The body is parsed, never logged. It can echo the prompt.
             stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty().let { text ->
+                Log.i("JarvisVoice", "chat_ms=$chatMs http=$code")
                 Log.i(TAG, "chat HTTP $code chat_ms=$chatMs")
                 if (code == 401 || code == 403) throw LlmCallFailed(code, "llm HTTP $code")
                 if (code !in 200..299) throw LlmCallFailed(code, "llm HTTP $code")
@@ -304,6 +305,8 @@ class ContextForgeLlmTransport(private val context: Context) {
         } catch (e: LlmCallFailed) {
             throw e
         } catch (e: Exception) {
+            val chatMs = (System.nanoTime() - started) / 1_000_000L
+            Log.i("JarvisVoice", "chat_ms=$chatMs http=0")
             Log.w(TAG, "chat transport failed: ${e.javaClass.simpleName}")
             throw LlmCallFailed(0, "llm unreachable")
         } finally {
