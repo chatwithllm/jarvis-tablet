@@ -17,8 +17,9 @@ import kotlin.math.sqrt
  * and does not fire on real voices. This replaces that detector. The
  * recognizer only considers the phrases in wake/phrases.json (armed
  * phrases, look-alikes, and the unknown token). A hit requires the
- * final text to be an armed phrase, not a reject (hey jarvis is always
- * a reject), and every word at or above the confidence floor.
+ * final text to be exactly "hey tablet", armed, not a reject, and
+ * every word at or above the confidence floor. Other phrases are not
+ * wakes even if an old preference still lists them.
  *
  * Audio is fed only while it is above the noise floor, with ~300 ms of
  * pre-roll and 0.8 s of hang. A partial that still ends in an armed
@@ -328,17 +329,17 @@ private fun evaluate(
     if (text !in settings.enabled || text in rejects || text == "hey jarvis") return null
     val words = obj.optJSONArray("result") ?: return null
     if (words.length() == 0) return null
-    var minConf = 1f
     val spoken = ArrayList<String>(words.length())
+    val confs = ArrayList<Float>(words.length())
     for (i in 0 until words.length()) {
         val word = words.optJSONObject(i) ?: return null
-        val conf = word.optDouble("conf", 0.0).toFloat()
-        if (conf < settings.threshold) return null
-        if (conf < minConf) minConf = conf
         spoken.add(normalize(word.optString("word")))
+        confs.add(word.optDouble("conf", 0.0).toFloat())
     }
     if (spoken.joinToString(" ") != text) return null
-    return VoskWakeEngine.Hit(text, minConf)
+    if (!WakeAccept.accept(text, confs, settings.threshold)) return null
+    if (text !in settings.enabled || text in rejects) return null
+    return VoskWakeEngine.Hit(text, confs.minOrNull() ?: return null)
 }
 
 private fun normalize(text: String): String =

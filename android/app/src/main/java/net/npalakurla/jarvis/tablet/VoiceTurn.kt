@@ -55,6 +55,7 @@ class VoiceTurn(
     private val bridge: JarvisBridge,
     private val transport: Transport,
     private val isQuietHours: () -> Boolean,
+    private val permit: TurnPermit = TurnPermit(),
 ) {
 
     /** One turn's result from the relay or the direct client. */
@@ -111,9 +112,12 @@ class VoiceTurn(
     @Volatile var isActive: Boolean = false
         private set
 
-    /** Start a turn (tap Talk, or a wake word). No-op when one is already running. */
-    fun start() {
-        if (isActive) return
+    /**
+     * Start one turn from an explicit Talk tap or an exact "hey tablet"
+     * wake. A second call while one is open does nothing. No network
+     * runs before [TurnPermit.tryBegin] succeeds.
+     */
+    fun start(source: TurnPermit.Source) {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
@@ -125,13 +129,13 @@ class VoiceTurn(
             )
             return
         }
+        val token = permit.tryBegin(source) ?: return
         isActive = true
-        // Mute wake scoring while the turn runs so the user's speech
-        // does not re-trigger (FR-29 tail; restored when the turn ends).
         WakeService.muteTailMs = TURN_MUTE_MS
+        WakeService.suppressScoring(TURN_MUTE_MS)
         turnJob = scope.launch {
             try {
-                runTurn()
+                runTurn(token)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -143,7 +147,8 @@ class VoiceTurn(
                         .put("message", "Voice turn failed. Try again."),
                 )
             } finally {
-                WakeService.muteTailMs = 0L
+                WakeService.suppressScoring(TurnPermit.ECHO_HOLD_MS)
+                permit.finish(token)
                 // Inside launch {}, bare isActive is CoroutineScope.isActive (a val).
                 this@VoiceTurn.isActive = false
             }
@@ -158,8 +163,8 @@ class VoiceTurn(
      */
     fun startFromWav(path: String?, direct: Boolean = false) {
         Log.i(VOICE, "debug_wav")
-        if (isActive) {
-            Log.i(VOICE, "result=busy")
+        if (!BuildConfig.DEBUG) {
+            Log.i(VOICE, "result=debug_disabled")
             return
         }
         val file = path?.let { File(it) }
@@ -172,13 +177,18 @@ class VoiceTurn(
             )
             return
         }
+        val token = permit.tryBegin(TurnPermit.Source.DEBUG) ?: run {
+            Log.i(VOICE, "result=busy")
+            return
+        }
         val wav = file.readBytes()
         isActive = true
         bridge.sendEvent("thinking", JSONObject().put("step", "listening"))
         WakeService.muteTailMs = TURN_MUTE_MS
+        WakeService.suppressScoring(TURN_MUTE_MS)
         turnJob = scope.launch {
             try {
-                val heard = transcribeWav(wav, pcm)
+                val heard = transcribeWav(pcm)
                 if (SafetyGate.block(heard)) {
                     showRefused()
                     return@launch
@@ -190,19 +200,29 @@ class VoiceTurn(
                         bridge.sendEvent("tts_finished", JSONObject())
                         return@launch
                     }
+                    if (!permit.allowChat(token)) {
+                        Log.i(VOICE, "result=revoked")
+                        return@launch
+                    }
                     val llm = transport.completeText(heard)
                     if (llm.isSuccess) {
                         Log.i(VOICE, "result=ok")
-                        present(llm.getOrThrow())
+                        present(llm.getOrThrow(), token)
                         return@launch
                     }
-                    val http = (llm.exceptionOrNull() as? LlmCallFailed)?.http ?: 0
-                    if (http == 401 || http == 403) {
-                        Log.i(VOICE, "result=llm_auth")
-                    }
-                    Log.i(VOICE, "path=relay")
-                } else {
-                    Log.i(VOICE, "path=relay")
+                    Log.i(VOICE, "result=error")
+                    bridge.sendEvent(
+                        "error",
+                        JSONObject()
+                            .put("code", "ha_unreachable")
+                            .put("message", "Could not complete that turn."),
+                    )
+                    return@launch
+                }
+                Log.i(VOICE, "path=relay")
+                if (!permit.allowChat(token)) {
+                    Log.i(VOICE, "result=revoked")
+                    return@launch
                 }
                 val result = transport.runTurn(wav)
                 val value = result.getOrElse {
@@ -216,7 +236,7 @@ class VoiceTurn(
                     return@launch
                 }
                 Log.i(VOICE, "result=ok")
-                present(value)
+                present(value, token)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -226,7 +246,8 @@ class VoiceTurn(
                     JSONObject().put("code", "voice_failed").put("message", "Voice turn failed. Try again."),
                 )
             } finally {
-                WakeService.muteTailMs = 0L
+                WakeService.suppressScoring(TurnPermit.ECHO_HOLD_MS)
+                permit.finish(token)
                 this@VoiceTurn.isActive = false
             }
         }
@@ -234,11 +255,18 @@ class VoiceTurn(
 
     /** Cancel the current turn (orb tapped while listening, or Back). */
     fun cancel() {
+        permit.revoke()
         recording = false
         confirmOpen = false
         turnJob?.cancel()
         isActive = false
         bridge.sendEvent("thinking", JSONObject().put("step", "cancelled"))
+    }
+
+    /** Drop eligibility when the activity pauses or is recreated. */
+    fun revokeStale() {
+        if (!isActive && !permit.isOpen) return
+        cancel()
     }
 
     /** Release the speech engine. MainActivity calls this from onDestroy. */
@@ -260,12 +288,12 @@ class VoiceTurn(
         }
     }
 
-    private suspend fun runTurn() {
+    private suspend fun runTurn(token: Long) {
         bridge.sendEvent("thinking", JSONObject().put("step", "listening"))
         if (!transport.preferDirect()) {
             Log.i(VOICE, "path=relay")
             Log.i(VOICE, "mic_start")
-            finishRelay(relayTurn(announce = false), directError = null)
+            finishRelay(relayTurn(announce = false, token = token), directError = null)
             return
         }
         Log.i(VOICE, "path=direct")
@@ -291,24 +319,26 @@ class VoiceTurn(
                 showRefused()
                 return
             }
+            if (!permit.allowChat(token)) {
+                Log.i(VOICE, "result=revoked")
+                return
+            }
             bridge.sendEvent("thinking", JSONObject().put("step", "transcribing"))
             val direct = transport.completeText(transcript)
             if (direct.isSuccess) {
                 Log.i(VOICE, "result=ok")
-                present(direct.getOrThrow())
+                present(direct.getOrThrow(), token)
                 return
             }
             val failure = direct.exceptionOrNull()
-            val http = (failure as? LlmCallFailed)?.http ?: 0
             Log.w(TAG, "direct llm failed: ${failure?.message}")
-            // 401/403 (and any other direct failure) continues on the
-            // Mini relay instead of ending the turn on the error.
-            if (http == 401 || http == 403) {
-                Log.i(VOICE, "result=llm_auth")
-            }
-            Log.i(VOICE, "path=relay")
-            Log.i(VOICE, "mic_start")
-            finishRelay(relayTurn(announce = true), failure)
+            Log.i(VOICE, "result=error")
+            bridge.sendEvent(
+                "error",
+                JSONObject()
+                    .put("code", "ha_unreachable")
+                    .put("message", "Could not complete that turn."),
+            )
             return
         }
         if (isSilence(heard.error)) {
@@ -318,9 +348,13 @@ class VoiceTurn(
             return
         }
         Log.w(TAG, "direct stt failed: ${heard.error}")
-        Log.i(VOICE, "path=relay")
-        Log.i(VOICE, "mic_start")
-        finishRelay(relayTurn(announce = true), IllegalStateException("stt ${heard.error}"))
+        Log.i(VOICE, "result=error")
+        bridge.sendEvent(
+            "error",
+            JSONObject()
+                .put("code", "stt_failed")
+                .put("message", "Speech recognition is unavailable."),
+        )
     }
 
     private suspend fun finishRelay(attempt: RelayAttempt, directError: Throwable?) {
@@ -328,6 +362,7 @@ class VoiceTurn(
             RelayAttempt.Presented -> Log.i(VOICE, "result=ok")
             RelayAttempt.Silent -> Log.i(VOICE, "result=silent")
             RelayAttempt.Refused -> Unit
+            RelayAttempt.Revoked -> Unit
             RelayAttempt.Unconfigured -> {
                 Log.i(VOICE, "result=error")
                 bridge.sendEvent(
@@ -376,6 +411,7 @@ class VoiceTurn(
         data object Silent : RelayAttempt()
         data object Unconfigured : RelayAttempt()
         data object Refused : RelayAttempt()
+        data object Revoked : RelayAttempt()
         data class Failed(val error: Throwable) : RelayAttempt()
     }
 
@@ -384,7 +420,7 @@ class VoiceTurn(
      * [announce] is set when this is the fallback after a direct-path
      * failure, so the person knows to speak again.
      */
-    private suspend fun relayTurn(announce: Boolean): RelayAttempt {
+    private suspend fun relayTurn(announce: Boolean, token: Long): RelayAttempt {
         if (announce) {
             bridge.sendEvent("thinking", JSONObject().put("step", "relay_listen"))
         }
@@ -393,29 +429,24 @@ class VoiceTurn(
             return RelayAttempt.Silent
         }
         val shorts = wavToPcm(audio)?.let { pcm16leToShorts(it) }
-        val heard = if (shorts != null) transcribeWav(audio, shorts) else null
+        val heard = if (shorts != null) transcribeWav(shorts) else null
         if (SafetyGate.block(heard)) {
             showRefused()
             return RelayAttempt.Refused
         }
+        if (!permit.allowChat(token)) {
+            Log.i(VOICE, "result=revoked")
+            return RelayAttempt.Revoked
+        }
         bridge.sendEvent("thinking", JSONObject().put("step", "transcribing"))
         val result = transport.runTurn(audio)
         val value = result.getOrElse { return RelayAttempt.Failed(it) }
-        present(value)
+        present(value, token)
         return RelayAttempt.Presented
     }
 
-    /** Cloud STT first. Vosk free-form is the offline fallback. */
-    private fun transcribeWav(wav: ByteArray, pcm: ShortArray): String? {
-        if (TokenStore.hasLlmCredentials(context)) {
-            when (val cloud = CloudVoice.transcribeWav(context, wav)) {
-                is CloudVoice.Stt.Ok -> {
-                    Log.i(VOICE, "stt=cloud")
-                    return cloud.text.trim().ifEmpty { null }
-                }
-                CloudVoice.Stt.Unavailable -> Unit
-            }
-        }
+    /** Local Vosk only. Cloud STT is not deployed and is not called. */
+    private fun transcribeWav(pcm: ShortArray): String? {
         Log.i(VOICE, "stt=vosk")
         return VoskWakeEngine.transcribe(context, pcm)
     }
@@ -430,7 +461,7 @@ class VoiceTurn(
         bridge.sendEvent("tts_finished", JSONObject())
     }
 
-    private suspend fun present(result: TurnResult) {
+    private suspend fun present(result: TurnResult, token: Long) {
         if (result.transcript.isNotBlank()) {
             bridge.sendEvent(
                 "transcript_final",
@@ -450,7 +481,7 @@ class VoiceTurn(
         // Piper audio is the model's reply. After a no / refusal / failed
         // execute, don't play it — it may claim the change already happened.
         val wav = if (outcome == null || outcome == "confirmed") result.ttsAudio else null
-        speakResponse(text, wav)
+        speakResponse(text, wav, token)
     }
 
     /**
@@ -624,7 +655,7 @@ class VoiceTurn(
         }
     }
 
-    private suspend fun speakResponse(text: String, wav: ByteArray?) {
+    private suspend fun speakResponse(text: String, wav: ByteArray?, token: Long) {
         val trimmed = text.trim()
         if (trimmed.isEmpty() && wav == null) {
             bridge.sendEvent("tts_finished", JSONObject())
@@ -636,7 +667,11 @@ class VoiceTurn(
                 playPcm(wav)
             } else {
                 // FR-26: quiet hours 21:00-07:00 at 20% volume.
-                deviceSpeech.speak(trimmed.take(600), if (isQuietHours()) 0.2f else 1.0f)
+                deviceSpeech.speak(
+                    trimmed.take(600),
+                    if (isQuietHours()) 0.2f else 1.0f,
+                    cloud = permit.allowTts(token),
+                )
             }
         } finally {
             bridge.sendEvent("tts_finished", JSONObject())

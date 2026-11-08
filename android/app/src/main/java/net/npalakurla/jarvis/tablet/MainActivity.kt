@@ -72,7 +72,9 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
             isQuietHours = { isQuietHours() },
         )
         // A wake word starts a turn (the HUD event goes out too).
-        bridge.onWakeDetected = { voiceTurn.start() }
+        bridge.onWakeDetected = { phrase ->
+            if (WakeAccept.isExactPhrase(phrase)) voiceTurn.start(TurnPermit.Source.WAKE)
+        }
         debugTurnHandler = { path, direct -> voiceTurn.startFromWav(path, direct) }
         VoiceDebug.handler = debugTurnHandler
         maybeRequestBatteryExemption()
@@ -130,6 +132,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
 
     override fun onPause() {
         super.onPause()
+        if (::voiceTurn.isInitialized) voiceTurn.revokeStale()
         if (WakeService.listener === bridge) WakeService.listener = null
     }
 
@@ -218,7 +221,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
                 "error",
                 JSONObject()
                     .put("code", "mic_permission")
-                    .put("message", "Microphone permission denied — voice is off. Grant it in Settings to enable okay computer and tap-to-talk."),
+                    .put("message", "Microphone permission denied — voice is off. Grant it in Settings to enable hey tablet and tap-to-talk."),
             )
         }
     }
@@ -294,7 +297,7 @@ class MainActivity : AppCompatActivity(), JarvisBridge.Host {
             )
             return
         }
-        voiceTurn.start()
+        voiceTurn.start(TurnPermit.Source.TALK)
     }
 
     override fun onOpenSettings() {

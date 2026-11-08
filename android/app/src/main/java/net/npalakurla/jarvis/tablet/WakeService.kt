@@ -47,7 +47,7 @@ class WakeService : Service() {
             NOTIFICATION_ID,
             NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("Jarvis listening")
-                .setContentText("Wake listening — okay computer, hey tablet, or hey jack")
+                .setContentText("Wake listening — hey tablet, or tap Talk")
                 .setSmallIcon(R.drawable.ic_launcher)
                 .setOngoing(true)
                 .build(),
@@ -183,7 +183,7 @@ class WakeService : Service() {
                     JSONObject().put("level", level),
                 )
                 val now = System.currentTimeMillis()
-                if (now < mutedUntilMs) continue
+                if (now < mutedUntilMs || now < suppressUntilMs) continue
                 val hit = VoskWakeEngine.onMicrophoneFrame(app, frame, read) ?: continue
                 mutedUntilMs = now + muteTailMs
                 WakeLog.detected(hit.phrase, hit.conf)
@@ -215,6 +215,13 @@ class WakeService : Service() {
 
         /** Mute wake scoring for this long after a detection (FR-29, default 0). */
         @Volatile var muteTailMs: Long = 0L
+
+        /** Drop frames until this clock time so a turn and its echo cannot re-wake. */
+        @Volatile var suppressUntilMs: Long = 0L
+
+        fun suppressScoring(durationMs: Long) {
+            suppressUntilMs = System.currentTimeMillis() + durationMs.coerceAtLeast(0L)
+        }
 
         @Volatile var isRunning: Boolean = false
             private set

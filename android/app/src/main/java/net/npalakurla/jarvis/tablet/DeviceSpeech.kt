@@ -26,9 +26,9 @@ import kotlin.coroutines.resume
 /**
  * Speech for the direct ContextForge path.
  *
- * A turn records PCM, then uses cloud STT (`POST /stt`) and cloud TTS
- * (`POST /tts`). Vosk free-form and Android [TextToSpeech] are the
- * fallbacks when the gateway has no audio route. Wake-word detection
+ * A turn records PCM and transcribes it with local Vosk. Cloud STT is
+ * not called. Cloud TTS is preferred, and Android [TextToSpeech] is the
+ * fallback when the gateway has no audio route. Wake-word detection
  * stays on the Vosk grammar model. Audio is not stored and not logged.
  *
  * `EXTRA_PREFER_OFFLINE` is left unset on purpose: on Android 11 the
@@ -59,10 +59,9 @@ class DeviceSpeech(private val context: Context) {
         if (manageWakeMic) WakeService.pauseMic()
         try {
             return withContext(Dispatchers.IO) {
-                // Cloud STT is first. Vosk (no grammar) is the offline
-                // fallback. The platform SpeechRecognizer is not used:
-                // this tablet does not have one, and it was flaky where
-                // it did. Wake-word detection stays on the grammar model.
+                // Cloud STT is not deployed. Do not call it. Vosk (no
+                // grammar) transcribes the turn. Wake stays on the
+                // grammar model, and only "hey tablet" can start a turn.
                 val pcm = recordPcm(onLevel) ?: return@withContext ListenResult(null, "no_match")
                 transcribeRecorded(pcm)
             }
@@ -72,16 +71,6 @@ class DeviceSpeech(private val context: Context) {
     }
 
     private fun transcribeRecorded(pcm: ShortArray): ListenResult {
-        if (TokenStore.hasLlmCredentials(context)) {
-            when (val cloud = CloudVoice.transcribeWav(context, CloudVoice.pcm16kToWav(pcm))) {
-                is CloudVoice.Stt.Ok -> {
-                    Log.i("JarvisVoice", "stt=cloud")
-                    val text = cloud.text.trim()
-                    return if (text.isEmpty()) ListenResult(null, "no_match") else ListenResult(text, null)
-                }
-                CloudVoice.Stt.Unavailable -> Unit
-            }
-        }
         Log.i("JarvisVoice", "stt=vosk")
         if (!VoskWakeEngine.modelReady(context)) return ListenResult(null, "recognizer_unavailable")
         val text = VoskWakeEngine.transcribe(context, pcm)?.trim().orEmpty()
@@ -167,10 +156,10 @@ class DeviceSpeech(private val context: Context) {
      * passes. A missing engine is not a turn failure — the HUD already
      * shows the text.
      */
-    suspend fun speak(text: String, volume: Float) {
+    suspend fun speak(text: String, volume: Float, cloud: Boolean = true) {
         val spoken = text.trim()
         if (spoken.isEmpty()) return
-        if (TokenStore.hasLlmCredentials(context)) {
+        if (cloud && TokenStore.hasLlmCredentials(context)) {
             val audio = withContext(Dispatchers.IO) { CloudVoice.synthesize(context, spoken) }
             val played = audio != null && audio.isNotEmpty() &&
                 runCatching { withTimeout(30_000) { playMp3(audio, volume) } }.getOrDefault(false)
