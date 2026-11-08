@@ -47,7 +47,7 @@ class WakeService : Service() {
             NOTIFICATION_ID,
             NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("Jarvis listening")
-                .setContentText("Wake listening — okay computer, hey tablet, or hey jack")
+                .setContentText("Wake listening — hey tablet, or tap Talk")
                 .setSmallIcon(R.drawable.ic_launcher)
                 .setOngoing(true)
                 .build(),
@@ -112,6 +112,7 @@ class WakeService : Service() {
             recorder = null
             worker = null
             micYielded = true
+            resetRequested = true
         }
     }
 
@@ -120,6 +121,7 @@ class WakeService : Service() {
             if (!micYielded) return
             micYielded = false
             if (!isRunning) return
+            resetRequested = true
             startMicLoop()
         }
     }
@@ -183,9 +185,13 @@ class WakeService : Service() {
                     JSONObject().put("level", level),
                 )
                 val now = System.currentTimeMillis()
-                if (now < mutedUntilMs) continue
+                if (resetRequested) {
+                    resetRequested = false
+                    VoskWakeEngine.discardHeardAudio()
+                }
+                if (now < mutedUntilMs || now < suppressUntilMs || now < ownAudioUntilMs) continue
                 val hit = VoskWakeEngine.onMicrophoneFrame(app, frame, read) ?: continue
-                mutedUntilMs = now + muteTailMs
+                mutedUntilMs = now + maxOf(muteTailMs, WakeGate.RING_MS)
                 WakeLog.detected(hit.phrase, hit.conf)
                 listener?.sendEvent(
                     "wake_detected",
@@ -215,6 +221,29 @@ class WakeService : Service() {
 
         /** Mute wake scoring for this long after a detection (FR-29, default 0). */
         @Volatile var muteTailMs: Long = 0L
+
+        /** Drop frames until this clock time so a turn and its echo cannot re-wake. */
+        @Volatile var suppressUntilMs: Long = 0L
+
+        /** Our own playback, plus a short ring. Not a conversation cooldown. */
+        @Volatile var ownAudioUntilMs: Long = 0L
+
+        @Volatile var resetRequested: Boolean = false
+
+        fun suppressScoring(durationMs: Long) {
+            resetRequested = true
+            suppressUntilMs = System.currentTimeMillis() + durationMs.coerceAtLeast(0L)
+        }
+
+        fun beginOwnAudio() {
+            resetRequested = true
+            ownAudioUntilMs = Long.MAX_VALUE / 4
+        }
+
+        fun endOwnAudio() {
+            resetRequested = true
+            ownAudioUntilMs = System.currentTimeMillis() + WakeGate.RING_MS
+        }
 
         @Volatile var isRunning: Boolean = false
             private set

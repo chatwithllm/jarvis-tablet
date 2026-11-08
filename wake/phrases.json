@@ -1,7 +1,9 @@
 {
-  "choices": ["okay computer", "hey tablet", "hey jack"],
-  "defaults": ["okay computer", "hey tablet", "hey jack"],
+  "choices": ["hey tablet"],
+  "defaults": ["hey tablet"],
   "reject": [
+    "okay computer",
+    "hey jack",
     "hey jarvis",
     "hi jarvis",
     "ok jarvis",

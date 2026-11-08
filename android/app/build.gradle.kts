@@ -14,8 +14,8 @@ android {
         applicationId = "net.npalakurla.jarvis.tablet"
         minSdk = 30 // Lenovo TB-J606F runs Android 11 (API 30)
         targetSdk = 34
-        versionCode = 8
-        versionName = "0.4.6-cloud-voice"
+        versionCode = 12
+        versionName = "0.4.11-wake-guard"
         // TB-J606F is arm64. Dropping the other ABIs keeps Vosk (and any
         // leftover native deps) from shipping three extra copies of libvosk.
         ndk {
@@ -164,4 +164,12 @@ dependencies {
     // Replaces onnxruntime: hey_jack.onnx did not detect real speech.
     implementation("com.alphacephei:vosk-android:0.3.75")
     testImplementation("junit:junit:4.13.2")
+    // android.jar stubs org.json and throws on put(). The real library
+    // has to come first on the unit-test classpath.
+    testImplementation("org.json:json:20240303")
+}
+
+tasks.withType<Test>().configureEach {
+    val jsonFirst = classpath.files.sortedBy { if (it.name.startsWith("json-")) 0 else 1 }
+    classpath = files(jsonFirst)
 }

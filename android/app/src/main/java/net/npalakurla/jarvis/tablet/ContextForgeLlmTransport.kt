@@ -15,8 +15,7 @@ import java.util.concurrent.ConcurrentHashMap
  * Direct ContextForge `/llm/v1` conversation client (OpenAI-compatible
  * `POST {base}/chat/completions`). This is the Phase 4 voice path: the
  * tablet talks to the gateway itself when the `cf-jarvis-tablet-llm`
- * bearer is saved, and [RoutingVoiceTransport] falls back to the Mini
- * relay when that call fails.
+ * bearer is saved. A turn does not fall back to the Mini relay.
  *
  * The LLM bearer is not the MCP bearer (the MCP one is rejected with
  * 403 on this route). Home Assistant reads go through [HaClient] and the
@@ -120,50 +119,29 @@ class ContextForgeLlmTransport(private val context: Context) {
         state: TurnState,
         ha: HaClient,
     ): VoiceTurn.TurnResult {
-        var includeTools = true
-        var retriedWithoutTools = false
-        var round = 0
-        var lastText = ""
-        while (round < MAX_ROUNDS) {
-            val response = try {
-                postChat(url, token, model, messages, if (includeTools) tools else null)
-            } catch (e: LlmCallFailed) {
-                // A gateway that rejects the tools array can still answer
-                // a plain question. Dropping tools is safe: with no tools
-                // the model cannot propose a change.
-                if (includeTools && e.http == 400 && !retriedWithoutTools) {
-                    Log.w(TAG, "llm rejected tools; retrying without them")
-                    includeTools = false
-                    retriedWithoutTools = true
-                    continue
+        val outcome = LeanChat.run(
+            post = { postChat(url, token, model, messages, tools) },
+            onTools = { message, calls ->
+                if (message.isNull("content")) message.put("content", "")
+                messages.put(message)
+                for (call in calls) {
+                    messages.put(
+                        JSONObject().apply {
+                            put("role", "tool")
+                            put("tool_call_id", call.id)
+                            put(
+                                "content",
+                                handleTool(ToolCall(call.id, call.name, call.args), ha, state)
+                                    .take(MAX_TOOL_CHARS),
+                            )
+                        },
+                    )
                 }
-                throw e
-            }
-            round++
-            val message = response
-                .optJSONArray("choices")
-                ?.optJSONObject(0)
-                ?.optJSONObject("message")
-                ?: throw LlmCallFailed(200, "llm returned no message")
-            val text = assistantText(message)
-            if (text.isNotBlank()) lastText = text
-            val calls = if (includeTools) toolCallsOf(message) else emptyList()
-            if (calls.isEmpty()) break
-            if (message.isNull("content")) message.put("content", "")
-            messages.put(message)
-            for (call in calls) {
-                messages.put(
-                    JSONObject().apply {
-                        put("role", "tool")
-                        put("tool_call_id", call.id)
-                        put("content", handleTool(call, ha, state).take(MAX_TOOL_CHARS))
-                    },
-                )
-            }
-        }
+            },
+        )
         return VoiceTurn.TurnResult(
             transcript = transcript,
-            responseText = lastText,
+            responseText = outcome.text,
             ttsAudio = null,
             proposedAction = state.proposed,
         )
@@ -285,12 +263,15 @@ class ContextForgeLlmTransport(private val context: Context) {
             put("messages", messages)
             put("stream", false)
             put("temperature", 0.2)
+            // Short spoken replies. This is a request cap, not a measured latency.
+            put("max_tokens", 160)
             if (tools != null) {
                 put("tools", tools)
                 put("tool_choice", "auto")
             }
         }
         val conn = URL(url).openConnection() as HttpURLConnection
+        val started = System.nanoTime()
         return try {
             conn.requestMethod = "POST"
             // Do not follow redirects: that would send the LLM bearer to another host.
@@ -299,14 +280,16 @@ class ContextForgeLlmTransport(private val context: Context) {
             conn.setRequestProperty("Authorization", "Bearer $token")
             conn.setRequestProperty("Accept", "application/json")
             conn.connectTimeout = 10_000
-            conn.readTimeout = 45_000
+            conn.readTimeout = 20_000
             conn.doOutput = true
             conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
+            val chatMs = (System.nanoTime() - started) / 1_000_000L
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             // The body is parsed, never logged. It can echo the prompt.
             stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty().let { text ->
-                Log.i(TAG, "chat HTTP $code")
+                Log.i("JarvisVoice", "chat_ms=$chatMs http=$code")
+                Log.i(TAG, "chat HTTP $code chat_ms=$chatMs")
                 if (code == 401 || code == 403) throw LlmCallFailed(code, "llm HTTP $code")
                 if (code !in 200..299) throw LlmCallFailed(code, "llm HTTP $code")
                 val trimmed = text.trim()
@@ -322,6 +305,8 @@ class ContextForgeLlmTransport(private val context: Context) {
         } catch (e: LlmCallFailed) {
             throw e
         } catch (e: Exception) {
+            val chatMs = (System.nanoTime() - started) / 1_000_000L
+            Log.i("JarvisVoice", "chat_ms=$chatMs http=0")
             Log.w(TAG, "chat transport failed: ${e.javaClass.simpleName}")
             throw LlmCallFailed(0, "llm unreachable")
         } finally {
@@ -331,7 +316,6 @@ class ContextForgeLlmTransport(private val context: Context) {
 
     companion object {
         private const val TAG = "ContextForgeLlm"
-        private const val MAX_ROUNDS = 4
         private const val MAX_TOOL_CHARS = 12_000
         private const val MAX_USER_CHARS = 2_000
         private val SAFE_KEY = Regex("[A-Za-z0-9_]{1,40}")
@@ -343,7 +327,10 @@ class ContextForgeLlmTransport(private val context: Context) {
                 "dry, polite, slightly crisp, never chatty, and never an imitation of a " +
                 "named actor. The user text is a speech transcript and may contain " +
                 "recognition mistakes. Reply in one or two short sentences meant to be " +
-                "spoken aloud. Use the ha_* tools for Home Assistant questions. " +
+                "spoken aloud. Never state the clock time. Never state a temperature, " +
+                "a sky condition, or a forecast unless a tool result in this conversation " +
+                "contains that reading. If it does not, say weather is unavailable. " +
+                "Use the ha_* tools for Home Assistant questions. " +
                 "Prefer ha_get_state when you know the entity_id. To change a device, call " +
                 "propose_action. That only asks the person to confirm; it does not run the " +
                 "change. Never say a change is already done. Never control locks, garage " +

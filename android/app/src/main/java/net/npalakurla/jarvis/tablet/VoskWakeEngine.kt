@@ -17,8 +17,9 @@ import kotlin.math.sqrt
  * and does not fire on real voices. This replaces that detector. The
  * recognizer only considers the phrases in wake/phrases.json (armed
  * phrases, look-alikes, and the unknown token). A hit requires the
- * final text to be an armed phrase, not a reject (hey jarvis is always
- * a reject), and every word at or above the confidence floor.
+ * final text to be exactly "hey tablet", armed, not a reject, and
+ * every word at or above the confidence floor. Other phrases are not
+ * wakes even if an old preference still lists them.
  *
  * Audio is fed only while it is above the noise floor, with ~300 ms of
  * pre-roll and 0.8 s of hang. A partial that still ends in an armed
@@ -59,6 +60,7 @@ object VoskWakeEngine {
                 val recognizer = Recognizer(voskModel, loaded.sampleRate.toFloat(), WakePhrases.grammarJson(loaded))
                 recognizer.setWords(true)
                 recognizer.setPartialWords(true)
+                recognizer.setMaxAlternatives(3)
                 session = Session(recognizer, loaded)
                 state = "ready"
                 true
@@ -125,34 +127,49 @@ object VoskWakeEngine {
                 if (!ensureReady(context)) return null
                 val voskModel = model ?: return null
                 val rate = (catalog?.sampleRate ?: 16_000).toFloat()
-                val recognizer = Recognizer(voskModel, rate)
-                try {
-                    recognizer.setWords(true)
-                    val parts = ArrayList<String>()
-                    var offset = 0
-                    while (offset < pcm.size) {
-                        val n = minOf(4_000, pcm.size - offset)
-                        val slice = ShortArray(n)
-                        System.arraycopy(pcm, offset, slice, 0, n)
-                        if (recognizer.acceptWaveForm(slice, n)) {
-                            collectText(recognizer.result, parts)
-                        }
-                        offset += n
-                    }
-                    collectText(recognizer.finalResult, parts)
-                    return parts.joinToString(" ").trim().ifEmpty { null }
-                } finally {
-                    runCatching { recognizer.close() }
-                }
+                val free = recognize(voskModel, rate, null, pcm)
+                val biased = recognize(voskModel, rate, SpokenFacts.intentGrammarJson(), pcm)
+                return SpokenFacts.chooseTranscript(free, biased)
             }
         } finally {
             injecting = false
         }
     }
 
+    private fun recognize(voskModel: Model, rate: Float, grammar: String?, pcm: ShortArray): String? {
+        val recognizer = if (grammar == null) {
+            Recognizer(voskModel, rate)
+        } else {
+            Recognizer(voskModel, rate, grammar)
+        }
+        try {
+            recognizer.setWords(true)
+            val parts = ArrayList<String>()
+            var offset = 0
+            while (offset < pcm.size) {
+                val n = minOf(4_000, pcm.size - offset)
+                val slice = ShortArray(n)
+                System.arraycopy(pcm, offset, slice, 0, n)
+                if (recognizer.acceptWaveForm(slice, n)) {
+                    collectText(recognizer.result, parts)
+                }
+                offset += n
+            }
+            collectText(recognizer.finalResult, parts)
+            return parts.joinToString(" ").trim().ifEmpty { null }
+        } finally {
+            runCatching { recognizer.close() }
+        }
+    }
+
     private fun collectText(json: String, parts: MutableList<String>) {
         val text = runCatching { JSONObject(json).optString("text") }.getOrDefault("").trim()
         if (text.isNotEmpty()) parts.add(text)
+    }
+
+    /** Drop a partial or pre-roll so later audio cannot finish an old phrase. */
+    fun discardHeardAudio() {
+        synchronized(lock) { session?.reset() }
     }
 
     fun close() {
@@ -323,22 +340,35 @@ private fun evaluate(
     rejects: Set<String>,
 ): VoskWakeEngine.Hit? {
     val obj = runCatching { JSONObject(json) }.getOrNull() ?: return null
-    val text = normalize(obj.optString("text"))
+    val altArr = obj.optJSONArray("alternatives")
+    val source = if (altArr != null && altArr.length() > 0) altArr.optJSONObject(0) ?: obj else obj
+    val alternatives = ArrayList<String>()
+    if (altArr != null) {
+        for (i in 0 until altArr.length()) {
+            alternatives.add(altArr.optJSONObject(i)?.optString("text").orEmpty())
+        }
+    }
+    val text = normalize(source.optString("text").ifEmpty { obj.optString("text") })
     if (text.isEmpty() || text == "[unk]") return null
     if (text !in settings.enabled || text in rejects || text == "hey jarvis") return null
-    val words = obj.optJSONArray("result") ?: return null
+    val words = source.optJSONArray("result") ?: obj.optJSONArray("result") ?: return null
     if (words.length() == 0) return null
-    var minConf = 1f
-    val spoken = ArrayList<String>(words.length())
+    val spans = ArrayList<WakeGate.Word>(words.length())
     for (i in 0 until words.length()) {
         val word = words.optJSONObject(i) ?: return null
-        val conf = word.optDouble("conf", 0.0).toFloat()
-        if (conf < settings.threshold) return null
-        if (conf < minConf) minConf = conf
-        spoken.add(normalize(word.optString("word")))
+        spans.add(
+            WakeGate.Word(
+                word = normalize(word.optString("word")),
+                startSec = word.optDouble("start", Double.NaN),
+                endSec = word.optDouble("end", Double.NaN),
+                conf = word.optDouble("conf", 0.0).toFloat(),
+            ),
+        )
     }
-    if (spoken.joinToString(" ") != text) return null
-    return VoskWakeEngine.Hit(text, minConf)
+    if (spans.joinToString(" ") { it.word } != text) return null
+    val hypothesis = WakeGate.Hypothesis(text, spans, alternatives)
+    if (!WakeGate.genuine(hypothesis, settings.threshold)) return null
+    return VoskWakeEngine.Hit(text, spans.minOf { it.conf })
 }
 
 private fun normalize(text: String): String =

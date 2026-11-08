@@ -83,9 +83,9 @@ class SettingsActivity : AppCompatActivity() {
         }
         fun refreshLlmState() {
             llmState.text = if (TokenStore.hasLlmCredentials(this)) {
-                "LLM token: saved. Voice tries ContextForge directly; the Mini relay is the fallback."
+                "LLM token: saved. One turn speaks with xAI, or the text stays on screen."
             } else {
-                "LLM token: not set. Voice uses the Mini relay."
+                "LLM token: not set. A voice turn is not sent."
             }
         }
         refreshLlmState()
@@ -147,7 +147,7 @@ class SettingsActivity : AppCompatActivity() {
                 }
                 val enabledPhrases = phraseBoxes.filter { it.isChecked }.map { it.text.toString() }.toSet()
                 if (enabledPhrases.isEmpty()) {
-                    toast("Leave at least one wake phrase on. Hey Jarvis is not available on this tablet.")
+                    toast("Hey tablet stays the only wake phrase. Talk on the dashboard still starts one turn.")
                     return@setOnClickListener
                 }
                 val wakeConf = confInput.text.toString().toFloatOrNull()
@@ -212,7 +212,7 @@ class SettingsActivity : AppCompatActivity() {
             addView(llmState)
             addView(clearLlm)
             addView(TextView(context).apply {
-                text = "Wake phrases (hey jarvis is never armed)"
+                text = "Wake phrase is hey tablet only. Other phrases are not armed."
                 textSize = 18f
                 setPadding(0, 28, 0, 0)
             })

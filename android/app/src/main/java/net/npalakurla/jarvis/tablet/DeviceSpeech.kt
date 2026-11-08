@@ -26,9 +26,9 @@ import kotlin.coroutines.resume
 /**
  * Speech for the direct ContextForge path.
  *
- * A turn records PCM, then uses cloud STT (`POST /stt`) and cloud TTS
- * (`POST /tts`). Vosk free-form and Android [TextToSpeech] are the
- * fallbacks when the gateway has no audio route. Wake-word detection
+ * A turn records PCM and transcribes it with local Vosk. Cloud STT is
+ * not called. Cloud TTS is preferred, and Android [TextToSpeech] is the
+ * fallback when the gateway has no audio route. Wake-word detection
  * stays on the Vosk grammar model. Audio is not stored and not logged.
  *
  * `EXTRA_PREFER_OFFLINE` is left unset on purpose: on Android 11 the
@@ -59,10 +59,9 @@ class DeviceSpeech(private val context: Context) {
         if (manageWakeMic) WakeService.pauseMic()
         try {
             return withContext(Dispatchers.IO) {
-                // Cloud STT is first. Vosk (no grammar) is the offline
-                // fallback. The platform SpeechRecognizer is not used:
-                // this tablet does not have one, and it was flaky where
-                // it did. Wake-word detection stays on the grammar model.
+                // Cloud STT is not deployed. Do not call it. Vosk (no
+                // grammar) transcribes the turn. Wake stays on the
+                // grammar model, and only "hey tablet" can start a turn.
                 val pcm = recordPcm(onLevel) ?: return@withContext ListenResult(null, "no_match")
                 transcribeRecorded(pcm)
             }
@@ -72,16 +71,6 @@ class DeviceSpeech(private val context: Context) {
     }
 
     private fun transcribeRecorded(pcm: ShortArray): ListenResult {
-        if (TokenStore.hasLlmCredentials(context)) {
-            when (val cloud = CloudVoice.transcribeWav(context, CloudVoice.pcm16kToWav(pcm))) {
-                is CloudVoice.Stt.Ok -> {
-                    Log.i("JarvisVoice", "stt=cloud")
-                    val text = cloud.text.trim()
-                    return if (text.isEmpty()) ListenResult(null, "no_match") else ListenResult(text, null)
-                }
-                CloudVoice.Stt.Unavailable -> Unit
-            }
-        }
         Log.i("JarvisVoice", "stt=vosk")
         if (!VoskWakeEngine.modelReady(context)) return ListenResult(null, "recognizer_unavailable")
         val text = VoskWakeEngine.transcribe(context, pcm)?.trim().orEmpty()
@@ -167,37 +156,67 @@ class DeviceSpeech(private val context: Context) {
      * passes. A missing engine is not a turn failure — the HUD already
      * shows the text.
      */
-    suspend fun speak(text: String, volume: Float) {
+    /**
+     * Speak with xAI only. Returns false when that audio is missing.
+     * Android speech is not used.
+     */
+    suspend fun speak(text: String, volume: Float, cloud: Boolean = true): Boolean {
         val spoken = text.trim()
-        if (spoken.isEmpty()) return
-        if (TokenStore.hasLlmCredentials(context)) {
-            val audio = withContext(Dispatchers.IO) { CloudVoice.synthesize(context, spoken) }
-            val played = audio != null && audio.isNotEmpty() &&
-                runCatching { withTimeout(30_000) { playMp3(audio, volume) } }.getOrDefault(false)
-            if (played) {
-                Log.i("JarvisVoice", "tts=cloud")
-                return
-            }
+        if (spoken.isEmpty() || !cloud) return false
+        if (!TokenStore.hasLlmCredentials(context)) return false
+        val startedNs = System.nanoTime()
+        val audio = withContext(Dispatchers.IO) { CloudVoice.synthesize(context, spoken) }
+        val ttsMs = (System.nanoTime() - startedNs) / 1_000_000L
+        Log.i("JarvisVoice", "tts_ms=$ttsMs")
+        if (audio == null || audio.isEmpty()) {
+            Log.i("JarvisVoice", "tts=unavailable")
+            return false
         }
-        Log.i("JarvisVoice", "tts=android")
-        speakAndroid(spoken, volume)
+        WakeService.beginOwnAudio()
+        val played = try {
+            runCatching { withTimeout(30_000) { playMp3(audio, volume) } }.getOrDefault(false)
+        } finally {
+            WakeService.endOwnAudio()
+        }
+        Log.i("JarvisVoice", if (played) "tts=cloud" else "tts=unavailable")
+        return played
     }
 
-    private suspend fun playMp3(bytes: ByteArray, volume: Float): Boolean =
-        withContext(Dispatchers.IO) {
-            val file = java.io.File.createTempFile("jarvis-tts", ".mp3", context.cacheDir)
-            try {
-                file.writeBytes(bytes)
+    /**
+     * Play on the main looper. Release is posted after the callback
+     * returns so the player is not destroyed while its event is still
+     * being delivered.
+     */
+    private suspend fun playMp3(bytes: ByteArray, volume: Float): Boolean {
+        val file = withContext(Dispatchers.IO) {
+            java.io.File.createTempFile("jarvis-tts", ".mp3", context.cacheDir).also {
+                it.writeBytes(bytes)
+            }
+        }
+        return try {
+            withContext(Dispatchers.Main) {
                 suspendCancellableCoroutine { cont ->
                     val player = android.media.MediaPlayer()
-                    fun finish(ok: Boolean) {
-                        runCatching { player.release() }
-                        runCatching { file.delete() }
+                    val handler = Handler(Looper.getMainLooper())
+                    val finished = AtomicBoolean(false)
+                    fun releaseAfterCallback() {
+                        handler.post {
+                            runCatching { player.reset() }
+                            runCatching { player.release() }
+                            runCatching { file.delete() }
+                        }
+                    }
+                    fun finish(ok: Boolean, marker: String) {
+                        if (!finished.compareAndSet(false, true)) return
+                        Log.i("JarvisVoice", marker)
+                        releaseAfterCallback()
                         if (cont.isActive) cont.resume(ok)
                     }
                     cont.invokeOnCancellation {
-                        runCatching { player.release() }
-                        runCatching { file.delete() }
+                        if (finished.compareAndSet(false, true)) {
+                            Log.i("JarvisVoice", "tts_play_cancel")
+                            releaseAfterCallback()
+                        }
                     }
                     player.setAudioAttributes(
                         android.media.AudioAttributes.Builder()
@@ -205,25 +224,33 @@ class DeviceSpeech(private val context: Context) {
                             .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
                             .build(),
                     )
-                    player.setOnCompletionListener { finish(true) }
-                    player.setOnErrorListener { _, _, _ ->
-                        finish(false)
+                    player.setOnPreparedListener {
+                        val startedOk = runCatching {
+                            val level = volume.coerceIn(0f, 1f)
+                            player.setVolume(level, level)
+                            player.start()
+                        }
+                        if (startedOk.isFailure) finish(false, "tts_play_error")
+                        else Log.i("JarvisVoice", "tts_play_start")
+                    }
+                    player.setOnCompletionListener { finish(true, "tts_play_complete") }
+                    player.setOnErrorListener { _, what, extra ->
+                        finish(false, "tts_play_error what=$what extra=$extra")
                         true
                     }
-                    val started = runCatching {
+                    val queued = runCatching {
                         player.setDataSource(file.absolutePath)
-                        val level = volume.coerceIn(0f, 1f)
-                        player.setVolume(level, level)
-                        player.prepare()
-                        player.start()
+                        player.prepareAsync()
                     }
-                    if (started.isFailure) finish(false)
+                    if (queued.isFailure) finish(false, "tts_play_error")
                 }
-            } catch (e: Exception) {
-                runCatching { file.delete() }
-                false
             }
+        } catch (e: Exception) {
+            runCatching { file.delete() }
+            Log.i("JarvisVoice", "tts_play_error")
+            false
         }
+    }
 
     private suspend fun speakAndroid(spoken: String, volume: Float) {
         val engine = ensureEngine() ?: return
